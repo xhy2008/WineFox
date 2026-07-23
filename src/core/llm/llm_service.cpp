@@ -29,6 +29,9 @@ void init_backend() {
     llama_log_set(silent_log_cb, nullptr);
 #endif
     llama_backend_init();
+    // NUMA: distribute memory across sockets. Safe no-op on single-socket
+    // systems; helps multi-socket servers with large models.
+    llama_numa_init(GGML_NUMA_STRATEGY_DISTRIBUTE);
 }
 
 void shutdown_backend() {
@@ -44,7 +47,8 @@ bool LlmService::load_base(const std::string& model_path, const LlmOptions& opts
     opts_ = opts;
 
     llama_model_params mparams = llama_model_default_params();
-    mparams.use_mmap = opts.use_mmap;
+    mparams.use_mmap  = opts.use_mmap;
+    mparams.use_mlock = opts.use_mlock;
     model_ = llama_model_load_from_file(model_path.c_str(), mparams);
     if (!model_) {
         WF_LOG_ERROR("LlmService: failed to load model: %s", model_path.c_str());
@@ -53,10 +57,17 @@ bool LlmService::load_base(const std::string& model_path, const LlmOptions& opts
 
     vocab_ = llama_model_get_vocab(model_);
 
+    uint32_t n_ctx = static_cast<uint32_t>(opts.n_ctx > 0 ? opts.n_ctx : 4096);
+
     llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx     = static_cast<uint32_t>(opts.n_ctx > 0 ? opts.n_ctx : 4096);
-    cparams.n_batch   = static_cast<uint32_t>(opts.n_batch > 0 ? opts.n_batch : 2048);
-    cparams.n_ubatch  = cparams.n_batch;           // match ubatch to batch for simplicity
+    cparams.n_ctx     = n_ctx;
+    // n_batch = n_ctx: avoids manual chunking in prefill_tokens_. llama.cpp
+    // internally splits by n_ubatch automatically, so one llama_decode call
+    // suffices for the entire prompt.
+    cparams.n_batch   = opts.n_batch > 0 ? static_cast<uint32_t>(opts.n_batch) : n_ctx;
+    // n_ubatch: smaller values improve L2/L3 cache locality during prefill.
+    // Default 512 (matches llama.cpp common.h default).
+    cparams.n_ubatch  = static_cast<uint32_t>(opts.n_ubatch > 0 ? opts.n_ubatch : 512);
     cparams.n_seq_max = 1;
     cparams.no_perf   = true;                       // we measure perf ourselves
 
@@ -78,10 +89,14 @@ bool LlmService::load_base(const std::string& model_path, const LlmOptions& opts
         cparams.type_v = GGML_TYPE_F16;
     }
 
-    // n_threads: 0 means auto (physical cores); set explicitly if provided.
+    // Threading: decode is memory-bound (fewer threads = less sync overhead);
+    // prefill is compute-bound (more threads = better throughput).
+    // 0 = auto (physical cores).
     if (opts.n_threads > 0) {
-        cparams.n_threads       = opts.n_threads;
-        cparams.n_threads_batch = opts.n_threads;
+        cparams.n_threads = opts.n_threads;
+    }
+    if (opts.n_threads_batch > 0) {
+        cparams.n_threads_batch = opts.n_threads_batch;
     }
 
     ctx_ = llama_new_context_with_model(model_, cparams);
@@ -115,11 +130,35 @@ bool LlmService::load_base(const std::string& model_path, const LlmOptions& opts
         return false;
     }
 
-    WF_LOG_INFO("LlmService: loaded %s (n_ctx=%u, n_batch=%u, n_threads=%d, thinking=%s, flash_attn=%s, kv_dtype=%s)",
+    // --- Warmup: trigger graph build and buffer allocation ---
+    // The first llama_decode call builds the compute graph and allocates
+    // backend buffers. Running a dummy decode here (with BOS token) avoids
+    // paying this cost on the first user message. The KV cache is cleared
+    // afterwards so it doesn't interfere with real prefill.
+    {
+        llama_token bos = llama_vocab_bos(vocab_);
+        if (bos != LLAMA_TOKEN_NULL) {
+            llama_batch warmup = llama_batch_init(1, 0, 1);
+            warmup.token[0]    = bos;
+            warmup.pos[0]      = 0;
+            warmup.n_seq_id[0] = 1;
+            warmup.seq_id[0][0] = 0;
+            warmup.logits[0]   = 1;
+            warmup.n_tokens    = 1;
+            llama_decode(ctx_, warmup);
+            llama_batch_free(warmup);
+            llama_memory_clear(llama_get_memory(ctx_), true);
+            llama_synchronize(ctx_);
+        }
+    }
+
+    WF_LOG_INFO("LlmService: loaded %s (n_ctx=%u, n_batch=%u, n_ubatch=%u, threads=%d/%d, thinking=%s, flash_attn=%s, kv_dtype=%s)",
                 model_path.c_str(),
                 llama_n_ctx(ctx_),
                 llama_n_batch(ctx_),
+                cparams.n_ubatch,
                 llama_n_threads(ctx_),
+                llama_n_threads_batch(ctx_),
                 opts.enable_thinking ? "on" : "off",
                 opts.flash_attention_enabled ? "on" : "off",
                 opts.kv_cache_dtype.c_str());
@@ -252,21 +291,36 @@ std::vector<llama_token> LlmService::tokenize_text_(const std::string& text) {
 std::vector<llama_token> LlmService::build_tokens_(const std::vector<memory::Message>& messages) {
     std::vector<llama_token> tokens;
 
+    // The <think> bridge: when enable_thinking=false, the Qwen3.5 generation
+    // prompt ends with <think>\n\n</think>\n\n. The model generates content
+    // AFTER this bridge. By including the bridge in BOTH the generation prompt
+    // AND historical assistant messages, cached_tokens_ (which ends with
+    // bridge + generated) aligns exactly with the next turn's new_tokens
+    // (where the historical assistant is rendered as bridge + gen_tokens +
+    // <|im_end|>). This eliminates the need to remove the bridge and re-prefill
+    // generated tokens every turn.
+    std::vector<llama_token> bridge_toks;
+    if (!opts_.enable_thinking) {
+        bridge_toks = tokenize_text_("<think>\n\n</think>\n\n");
+    }
+
     for (const auto& m : messages) {
         // --- Header: <|im_start|>{role}\n ---
-        // Tokenise "<|im_start|>{role}\n" as a single string so parse_special
-        // picks up <|im_start|> as one token and BPE handles role+\n.
         std::string header = "<|im_start|>" + m.role + "\n";
         auto hdr_toks = tokenize_text_(header);
         tokens.insert(tokens.end(), hdr_toks.begin(), hdr_toks.end());
 
         // --- Content ---
         if (m.is_assistant() && !m.gen_tokens.empty()) {
+            // Insert the bridge before generated tokens so the layout matches
+            // the generation prompt. The model naturally produces content
+            // after <think>\n\n</think>\n\n, so this is semantically correct.
+            if (!bridge_toks.empty()) {
+                tokens.insert(tokens.end(), bridge_toks.begin(), bridge_toks.end());
+            }
             // Use the model-generated token IDs directly. The trailing EOG
             // token (== <|im_end|>) is excluded because we append <|im_end|>
-            // as part of the footer below — this keeps the footer layout
-            // identical across assistant and non-assistant messages.
-            size_t n = m.gen_tokens.size();
+            // as part of the footer below.
             if (llama_vocab_is_eog(vocab_, m.gen_tokens.back())) {
                 tokens.insert(tokens.end(), m.gen_tokens.begin(), m.gen_tokens.end() - 1);
             } else {
@@ -286,9 +340,8 @@ std::vector<llama_token> LlmService::build_tokens_(const std::vector<memory::Mes
     // --- Generation prompt: <|im_start|>assistant\n [<think>\n\n</think>\n\n] ---
     auto gen_hdr = tokenize_text_("<|im_start|>assistant\n");
     tokens.insert(tokens.end(), gen_hdr.begin(), gen_hdr.end());
-    if (!opts_.enable_thinking) {
-        auto bridge = tokenize_text_("<think>\n\n</think>\n\n");
-        tokens.insert(tokens.end(), bridge.begin(), bridge.end());
+    if (!bridge_toks.empty()) {
+        tokens.insert(tokens.end(), bridge_toks.begin(), bridge_toks.end());
     }
 
     return tokens;
@@ -304,14 +357,30 @@ bool LlmService::prefill_tokens_(const std::vector<llama_token>& tokens, size_t 
 
     const uint32_t n_batch = llama_n_batch(ctx_);
 
-    // Chunked prefill. llama_batch_get_one with pos=nullptr auto-sets positions
-    // from memory->seq_pos_max(0)+1, so incremental prefill works correctly
-    // when KV cache is not cleared.
+    // Use llama_batch with explicit pos/seq_id to avoid the auto-generation
+    // overhead of llama_batch_get_one (which calls memory->seq_pos_max() and
+    // builds pos/seq_id arrays on every decode call).
+    //
+    // Position = start + i: for full prefill (start=0, KV cleared) positions
+    // are 0,1,2,...; for incremental prefill (start=common) positions are
+    // common,common+1,... which matches the existing KV cache prefix.
     for (int i = 0; i < n; i += static_cast<int>(n_batch)) {
         int32_t chunk = std::min(static_cast<int>(n_batch), n - i);
-        llama_batch batch = llama_batch_get_one(
-            const_cast<llama_token*>(tokens.data()) + start + i, chunk);
+
+        llama_batch batch = llama_batch_init(chunk, /*embd=*/0, /*n_seq_max=*/1);
+        for (int32_t j = 0; j < chunk; ++j) {
+            batch.token[j]    = tokens[start + i + j];
+            batch.pos[j]      = static_cast<int32_t>(start + i + j);
+            batch.n_seq_id[j] = 1;
+            batch.seq_id[j][0] = 0;
+            // Only request logits for the last token in the final chunk
+            // (needed for sampling). This reduces output buffer usage.
+            batch.logits[j] = (i + j == n - 1) ? 1 : 0;
+        }
+        batch.n_tokens = chunk;
+
         int32_t rc = llama_decode(ctx_, batch);
+        llama_batch_free(batch);
         if (rc != 0) {
             WF_LOG_ERROR("LlmService: llama_decode failed during prefill (rc=%d, offset=%d)", rc, i);
             return false;
@@ -493,63 +562,13 @@ void LlmService::chat_stream(const std::vector<memory::Message>& messages,
     std::vector<llama_token> generated;
     generate_loop_(on_token, sp, &generated);
 
-    // --- Remove the <think> bridge from new_tokens and KV cache ---
-    // When enable_thinking=false, build_tokens_ appends an empty
-    // <think>\n\n</think>\n\n block to the generation prompt. These bridge
-    // tokens are in new_tokens (and the KV cache) but absent from the next
-    // turn's prompt (build_tokens_ renders historical assistant messages
-    // without a <think> prefix). We remove them from both the KV cache and
-    // new_tokens, then re-prefill the generated tokens so their KV entries
-    // sit at the correct positions. This makes cached_tokens_ align exactly
-    // with the next turn's new_tokens prefix, enabling INCREMENTAL reuse.
-    if (!opts_.enable_thinking && new_tokens.size() >= 2) {
-        // <think> is a single special token in the Qwen3.5 vocab.
-        llama_token think_tok = LLAMA_TOKEN_NULL;
-        auto tv = tokenize_text_("<think>");
-        if (tv.size() == 1) think_tok = tv[0];
-
-        if (think_tok != LLAMA_TOKEN_NULL) {
-            // Search backwards for the <think> token (the generation prompt
-            // is at the very end of new_tokens, so the last <think> is the
-            // bridge).
-            size_t think_pos = new_tokens.size();
-            for (size_t i = new_tokens.size(); i > 0; --i) {
-                if (new_tokens[i - 1] == think_tok) {
-                    think_pos = i - 1;
-                    break;
-                }
-            }
-            if (think_pos < new_tokens.size()) {
-                int32_t bridge_start = static_cast<int32_t>(think_pos);
-                int32_t bridge_size  = static_cast<int32_t>(new_tokens.size() - think_pos);
-                llama_memory_t mem = llama_get_memory(ctx_);
-                // Clear KV cache from bridge_start to the end (removes both
-                // the bridge tokens and the generated tokens' KV entries).
-                llama_memory_seq_rm(mem, 0, bridge_start, -1);
-                // Re-prefill the generated tokens so their KV entries are at
-                // positions [bridge_start, bridge_start + generated.size()).
-                // After the rm above, seq_pos_max(0) = bridge_start - 1, so
-                // llama_batch_get_one auto-assigns positions from bridge_start.
-                if (!generated.empty()) {
-                    if (!prefill_tokens_(generated, 0)) {
-                        WF_LOG_ERROR("LlmService: bridge re-prefill failed");
-                    }
-                }
-                new_tokens.erase(new_tokens.begin() + bridge_start, new_tokens.end());
-                WF_LOG_DEBUG("KV: removed <think> bridge (%d tokens at %d), re-prefilled %zu generated",
-                             bridge_size, bridge_start, generated.size());
-            }
-        }
-    }
-
     // --- Update cache for next turn ---
-    // cached_tokens_ = new_tokens (bridge removed) + generated (incl. EOG).
-    // The next turn's build_tokens_ renders historical assistant messages as:
-    //   <|im_start|>assistant\n {gen_tokens (excl. EOG)} <|im_end|> \n
-    // which exactly matches cached_tokens_:
-    //   <|im_start|>assistant\n {gen_tokens (excl. EOG)} <|im_end| (=EOG)
-    // followed by the next user message's \n prefix — so the common prefix
-    // extends through the EOG token, yielding INCREMENTAL reuse.
+    // No bridge removal needed! build_tokens_ renders historical assistant
+    // messages WITH the <think> bridge prefix, so cached_tokens_ (which ends
+    // with bridge + generated) aligns exactly with the next turn's new_tokens
+    // (where the historical assistant is bridge + gen_tokens + <|im_end|>).
+    // The EOG token (= <|im_end|>) at the end of generated matches the
+    // footer <|im_end|> in the next turn's rendering.
     cached_tokens_ = new_tokens;
     cached_tokens_.insert(cached_tokens_.end(), generated.begin(), generated.end());
     cache_valid_ = true;

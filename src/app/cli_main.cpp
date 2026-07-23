@@ -228,8 +228,11 @@ int main(int argc, char** argv) {
     winefox::llm::LlmOptions lopts;
     lopts.n_ctx                   = cfg.llm.n_ctx;
     lopts.n_batch                 = cfg.llm.n_batch;
+    lopts.n_ubatch                = cfg.llm.n_ubatch;
     lopts.n_threads               = cfg.llm.n_threads;
+    lopts.n_threads_batch         = cfg.llm.n_threads_batch;
     lopts.use_mmap                = cfg.llm.use_mmap;
+    lopts.use_mlock               = cfg.llm.use_mlock;
     lopts.enable_thinking         = cfg.llm.enable_thinking;
     lopts.flash_attention_enabled = cfg.llm.flash_attention_enabled;
     lopts.kv_cache_dtype          = cfg.llm.kv_cache_dtype;

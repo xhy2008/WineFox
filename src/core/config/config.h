@@ -25,9 +25,12 @@ struct Config {
         std::string lora_path;
         float       lora_scale    = 1.0f;
         int         n_ctx         = 4096;
-        int         n_batch       = 2048;
-        int         n_threads     = 0;      // 0 = auto (physical cores)
+        int         n_batch       = 0;      // 0 = auto (= n_ctx)
+        int         n_ubatch      = 512;    // micro-batch (cache locality)
+        int         n_threads     = 0;      // 0 = auto (physical cores) — decode
+        int         n_threads_batch = 0;    // 0 = auto — prefill (compute-bound)
         bool        use_mmap      = true;
+        bool        use_mlock     = false;  // lock model in RAM
         bool        enable_thinking = false;  // false = -rea off, suppress <think>
         bool        flash_attention_enabled = true;  // LLAMA_FLASH_ATTN_TYPE_ENABLED
         std::string kv_cache_dtype = "f16";  // "f16", "q8_0", "q4_0"

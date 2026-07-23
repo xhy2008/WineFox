@@ -43,8 +43,11 @@ bool Config::load(const std::string& path) {
         if (l.contains("lora_scale"))      llm.lora_scale      = l["lora_scale"].get<float>();
         if (l.contains("n_ctx"))           llm.n_ctx           = l["n_ctx"].get<int>();
         if (l.contains("n_batch"))         llm.n_batch         = l["n_batch"].get<int>();
+        if (l.contains("n_ubatch"))        llm.n_ubatch        = l["n_ubatch"].get<int>();
         if (l.contains("n_threads"))       llm.n_threads       = l["n_threads"].get<int>();
+        if (l.contains("n_threads_batch")) llm.n_threads_batch = l["n_threads_batch"].get<int>();
         if (l.contains("use_mmap"))        llm.use_mmap        = l["use_mmap"].get<bool>();
+        if (l.contains("use_mlock"))       llm.use_mlock       = l["use_mlock"].get<bool>();
         if (l.contains("enable_thinking")) llm.enable_thinking = l["enable_thinking"].get<bool>();
         if (l.contains("flash_attention_enabled"))
             llm.flash_attention_enabled = l["flash_attention_enabled"].get<bool>();
@@ -99,8 +102,11 @@ bool Config::save(const std::string& path) const {
         {"lora_scale",              llm.lora_scale},
         {"n_ctx",                   llm.n_ctx},
         {"n_batch",                 llm.n_batch},
+        {"n_ubatch",                llm.n_ubatch},
         {"n_threads",               llm.n_threads},
+        {"n_threads_batch",         llm.n_threads_batch},
         {"use_mmap",                llm.use_mmap},
+        {"use_mlock",               llm.use_mlock},
         {"enable_thinking",         llm.enable_thinking},
         {"flash_attention_enabled", llm.flash_attention_enabled},
         {"kv_cache_dtype",          llm.kv_cache_dtype},

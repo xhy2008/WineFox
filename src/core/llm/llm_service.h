@@ -31,9 +31,12 @@ void shutdown_backend();
 
 struct LlmOptions {
     int  n_ctx       = 4096;
-    int  n_batch     = 2048;
-    int  n_threads   = 0;     // 0 = auto (physical cores)
+    int  n_batch     = 0;     // 0 = auto (= n_ctx, avoids manual chunking)
+    int  n_ubatch    = 512;   // micro-batch for prefill (smaller = better cache locality)
+    int  n_threads   = 0;     // 0 = auto (physical cores) — for decode (memory-bound)
+    int  n_threads_batch = 0; // 0 = auto (2x n_threads) — for prefill (compute-bound)
     bool use_mmap    = true;
+    bool use_mlock   = false; // force model to stay in RAM (avoids page faults)
     // When false, passes enable_thinking=false to the model's jinja chat
     // template, equivalent to `llama-cli -rea off`. Qwen3.5 then skips the
     // <think> reasoning block entirely.
