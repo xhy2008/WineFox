@@ -288,7 +288,8 @@ std::vector<llama_token> LlmService::tokenize_text_(const std::string& text) {
 // build_tokens_  (BPE-stable prompt construction for KV cache reuse)
 // ---------------------------------------------------------------------------
 
-std::vector<llama_token> LlmService::build_tokens_(const std::vector<memory::Message>& messages) {
+std::vector<llama_token> LlmService::build_tokens_(const std::vector<memory::Message>& messages,
+                                                     bool add_gen_prompt) {
     std::vector<llama_token> tokens;
 
     // The <think> bridge: when enable_thinking=false, the Qwen3.5 generation
@@ -337,11 +338,13 @@ std::vector<llama_token> LlmService::build_tokens_(const std::vector<memory::Mes
         tokens.insert(tokens.end(), nl_toks.begin(), nl_toks.end());
     }
 
-    // --- Generation prompt: <|im_start|>assistant\n [<think>\n\n</think>\n\n] ---
-    auto gen_hdr = tokenize_text_("<|im_start|>assistant\n");
-    tokens.insert(tokens.end(), gen_hdr.begin(), gen_hdr.end());
-    if (!bridge_toks.empty()) {
-        tokens.insert(tokens.end(), bridge_toks.begin(), bridge_toks.end());
+    // --- Generation prompt (optional): <|im_start|>assistant\n [<think>...] ---
+    if (add_gen_prompt) {
+        auto gen_hdr = tokenize_text_("<|im_start|>assistant\n");
+        tokens.insert(tokens.end(), gen_hdr.begin(), gen_hdr.end());
+        if (!bridge_toks.empty()) {
+            tokens.insert(tokens.end(), bridge_toks.begin(), bridge_toks.end());
+        }
     }
 
     return tokens;
@@ -493,6 +496,45 @@ void LlmService::generate_loop_(const std::function<bool(const std::string&)>& o
 
     last_perf_.n_eval      = n_eval;
     last_perf_.t_eval_ms   = t_eval_ms;
+}
+
+// ---------------------------------------------------------------------------
+// warmup_prefill  (pre-warm KV cache with static prefix, e.g. system prompt)
+// ---------------------------------------------------------------------------
+
+double LlmService::warmup_prefill(const std::vector<memory::Message>& messages) {
+    if (!ready()) {
+        WF_LOG_ERROR("LlmService: warmup_prefill called before load_base");
+        return -1.0;
+    }
+
+    // Build tokens WITHOUT generation prompt — this is just the static prefix
+    // (system message). The first chat_stream() will append user messages +
+    // generation prompt, and the common prefix will match these tokens.
+    std::vector<llama_token> new_tokens = build_tokens_(messages, /*add_gen_prompt=*/false);
+    if (new_tokens.empty()) {
+        WF_LOG_ERROR("LlmService: warmup build_tokens_ returned 0 tokens");
+        return -1.0;
+    }
+
+    // Full prefill (clear any existing KV cache from the BOS warmup in load_base).
+    llama_memory_clear(llama_get_memory(ctx_), true);
+
+    auto t0 = winefox::time::now_us();
+    if (!prefill_tokens_(new_tokens, 0)) {
+        WF_LOG_ERROR("LlmService: warmup prefill failed");
+        return -1.0;
+    }
+    auto t1 = winefox::time::now_us();
+    double prefill_ms = (t1 - t0) / 1000.0;
+
+    // Store in cached_tokens_ so the next chat_stream() does INCREMENTAL reuse.
+    cached_tokens_ = std::move(new_tokens);
+    cache_valid_   = true;
+
+    WF_LOG_INFO("LlmService: warmup prefill %zu tokens in %.0f ms",
+                cached_tokens_.size(), prefill_ms);
+    return prefill_ms;
 }
 
 // ---------------------------------------------------------------------------

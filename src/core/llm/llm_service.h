@@ -98,6 +98,13 @@ public:
     // or any event that changes the prompt prefix.
     void invalidate_cache() { cache_valid_ = false; }
 
+    // Pre-warm the KV cache with a static prefix (e.g. system prompt) so
+    // the first chat_stream() only needs to prefill the user input suffix.
+    // Builds tokens WITHOUT generation prompt, prefills them, and stores
+    // the token sequence in cached_tokens_ for INCREMENTAL reuse.
+    // Returns prefill time in milliseconds, or -1 on failure.
+    double warmup_prefill(const std::vector<memory::Message>& messages);
+
     void close();
     ~LlmService();
 
@@ -118,8 +125,10 @@ private:
     // Layout per message:  <|im_start|>{role}\n {content} <|im_end|>\n
     //   - assistant content comes from m.gen_tokens (excluding trailing EOG)
     //   - other content is tokenised via tokenize_text_
-    // Generation prompt: <|im_start|>assistant\n[<think>\n\n</think>\n\n]
-    std::vector<llama_token> build_tokens_(const std::vector<memory::Message>& messages);
+    // Generation prompt (when add_gen_prompt=true):
+    //   <|im_start|>assistant\n[<think>\n\n</think>\n\n]
+    std::vector<llama_token> build_tokens_(const std::vector<memory::Message>& messages,
+                                            bool add_gen_prompt = true);
 
     // Prefill tokens[start..end) in n_batch-sized chunks. KV cache must be
     // cleared beforehand if doing a full prefill; for incremental prefill,

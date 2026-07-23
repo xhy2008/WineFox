@@ -55,20 +55,31 @@ bool ConversationManager::init(llm::LlmService* llm,
     WF_LOG_INFO("ConvMgr: initialised (session=%lld, lora=%s)",
                 session_id_,
                 cfg_.lora_path.empty() ? "off" : "on");
+
+    // --- Pre-warm the KV cache with the system prompt ---
+    // This prefills the static system message (persona + profile) immediately
+    // at startup, so the first user message only needs to prefill the user
+    // input + generation prompt (suffix), not the entire system prompt.
+    // Profile is empty at startup (no distillation has happened yet), so the
+    // system message is just the persona text — identical to what
+    // build_messages_ produces on the first turn.
+    auto sys_msg = build_system_message_();
+    double warmup_ms = llm_->warmup_prefill({sys_msg});
+    if (warmup_ms >= 0) {
+        WF_LOG_INFO("ConvMgr: system prompt warmup %.0f ms (%zu tokens)",
+                    warmup_ms, 0);  // token count logged inside warmup_prefill
+    }
+
     return true;
 }
 
 // ---------------------------------------------------------------------------
-// build_messages_
+// build_system_message_
 // ---------------------------------------------------------------------------
 
-void ConversationManager::build_messages_(std::vector<memory::Message>& messages,
-                                           const std::string& user_input,
-                                           const std::string& current_recall) {
-    // --- System message: persona + [档案] only (static, KV-cacheable) ---
+memory::Message ConversationManager::build_system_message_() const {
     std::string sys = cfg_.system_prompt;
 
-    // [档案] profile
     auto profile = recall_->get_all_profile();
     if (!profile.empty()) {
         sys += "\n\n[档案]\n";
@@ -78,7 +89,18 @@ void ConversationManager::build_messages_(std::vector<memory::Message>& messages
     }
 
     int64_t now = winefox::time::now_ms() / 1000;
-    messages.push_back({"system", sys, "", "", now});
+    return {"system", sys, "", "", now};
+}
+
+// ---------------------------------------------------------------------------
+// build_messages_
+// ---------------------------------------------------------------------------
+
+void ConversationManager::build_messages_(std::vector<memory::Message>& messages,
+                                           const std::string& user_input,
+                                           const std::string& current_recall) {
+    // --- System message: persona + [档案] (static, KV-cacheable) ---
+    messages.push_back(build_system_message_());
 
     // --- Short-term window (recent turns) ---
     // Recall is merged into the user message content as a suffix, NOT emitted
@@ -99,6 +121,7 @@ void ConversationManager::build_messages_(std::vector<memory::Message>& messages
     }
 
     // --- Current user turn (recall merged into user content) ---
+    int64_t now = winefox::time::now_ms() / 1000;
     std::string merged_input = user_input;
     if (!current_recall.empty()) {
         merged_input += "\n\n" + current_recall;
@@ -268,9 +291,13 @@ long long ConversationManager::maybe_distill() {
     } else {
         WF_LOG_INFO("ConvMgr: distillation complete (recall_file=%lld)", file_id);
     }
-    // Distillation modifies profile/recall DB and drains short-term memory,
-    // so the KV cache prefix is no longer valid.
-    llm_->invalidate_cache();
+    // Distillation modifies profile/recall DB and drains short-term memory.
+    // Re-warm the system prompt (profile may have changed) so the next turn
+    // is INCREMENTAL instead of a full re-prefill.
+    {
+        auto sys_msg = build_system_message_();
+        llm_->warmup_prefill({sys_msg});
+    }
     return file_id;
 }
 
@@ -288,7 +315,9 @@ long long ConversationManager::force_distill() {
     }
 
     long long file_id = distiller_->distill(drained, session_id_);
-    llm_->invalidate_cache();
+    // Re-warm with the (possibly updated) system prompt.
+    auto sys_msg = build_system_message_();
+    llm_->warmup_prefill({sys_msg});
     return file_id;
 }
 
@@ -352,8 +381,11 @@ std::string ConversationManager::get_memory_info() const {
 
 void ConversationManager::reset() {
     short_term_->clear();
-    llm_->invalidate_cache();  // force full re-prefill on next turn
-    WF_LOG_INFO("ConvMgr: short-term memory cleared, KV cache invalidated");
+    // Re-warm the system prompt so the next turn is INCREMENTAL (only user
+    // input suffix needs prefill) instead of a full re-prefill.
+    auto sys_msg = build_system_message_();
+    llm_->warmup_prefill({sys_msg});
+    WF_LOG_INFO("ConvMgr: short-term memory cleared, KV cache re-warmed");
 }
 
 } // namespace pipeline

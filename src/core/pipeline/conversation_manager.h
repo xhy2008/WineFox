@@ -68,6 +68,10 @@ public:
     long long session_id() const { return session_id_; }
 
 private:
+    // Build just the system message (persona + profile). Used by both
+    // build_messages_ and the init() warmup to avoid code duplication.
+    memory::Message build_system_message_() const;
+
     void build_messages_(std::vector<memory::Message>& messages,
                          const std::string& user_input,
                          const std::string& current_recall);
