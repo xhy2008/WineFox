@@ -1,0 +1,13 @@
+char ::= [^"\\\x7F\x00-\x1F] | [\\] (["\\bfnrt] | "u" [0-9a-fA-F]{4})
+profile ::= "{" space  (profile-additional-kv ( "," space profile-additional-kv )* )? space "}"
+profile-additional-kv ::= string ":" space string
+profile-kv ::= "\"profile\"" space ":" space profile
+root ::= "{" space title-kv "," space summary-kv "," space profile-kv "," space segments-kv space "}"
+segments ::= "[" space (segments-item ("," space segments-item)*)? space "]"
+segments-item ::= "{" space segments-item-content-kv space "}"
+segments-item-content-kv ::= "\"content\"" space ":" space string
+segments-kv ::= "\"segments\"" space ":" space segments
+space ::= | " " | "\n"{1,2} [ \t]{0,20}
+string ::= "\"" char* "\""
+summary-kv ::= "\"summary\"" space ":" space string
+title-kv ::= "\"title\"" space ":" space string

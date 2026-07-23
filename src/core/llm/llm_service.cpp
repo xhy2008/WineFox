@@ -1,0 +1,656 @@
+#include "llm_service.h"
+
+#include "../log/log.h"
+#include "../util/time.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+
+namespace winefox {
+namespace llm {
+
+// ---------------------------------------------------------------------------
+// Backend lifecycle + log control
+// ---------------------------------------------------------------------------
+
+#ifdef NDEBUG
+// Release: silently swallow all llama.cpp/ggml log output.
+static void silent_log_cb(ggml_log_level level, const char* text, void* /*user_data*/) {
+    // Still forward genuine errors to stderr so failures are visible.
+    if (level >= GGML_LOG_LEVEL_ERROR) {
+        std::fputs(text, stderr);
+    }
+}
+#endif
+
+void init_backend() {
+#ifdef NDEBUG
+    llama_log_set(silent_log_cb, nullptr);
+#endif
+    llama_backend_init();
+}
+
+void shutdown_backend() {
+    llama_backend_free();
+}
+
+// ---------------------------------------------------------------------------
+// load_base
+// ---------------------------------------------------------------------------
+
+bool LlmService::load_base(const std::string& model_path, const LlmOptions& opts) {
+    close();
+    opts_ = opts;
+
+    llama_model_params mparams = llama_model_default_params();
+    mparams.use_mmap = opts.use_mmap;
+    model_ = llama_model_load_from_file(model_path.c_str(), mparams);
+    if (!model_) {
+        WF_LOG_ERROR("LlmService: failed to load model: %s", model_path.c_str());
+        return false;
+    }
+
+    vocab_ = llama_model_get_vocab(model_);
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx     = static_cast<uint32_t>(opts.n_ctx > 0 ? opts.n_ctx : 4096);
+    cparams.n_batch   = static_cast<uint32_t>(opts.n_batch > 0 ? opts.n_batch : 2048);
+    cparams.n_ubatch  = cparams.n_batch;           // match ubatch to batch for simplicity
+    cparams.n_seq_max = 1;
+    cparams.no_perf   = true;                       // we measure perf ourselves
+
+    // Flash Attention
+    cparams.flash_attn_type = opts.flash_attention_enabled
+        ? LLAMA_FLASH_ATTN_TYPE_ENABLED
+        : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+
+    // KV cache data type
+    if (opts.kv_cache_dtype == "q8_0") {
+        cparams.type_k = GGML_TYPE_Q8_0;
+        cparams.type_v = GGML_TYPE_Q8_0;
+    } else if (opts.kv_cache_dtype == "q4_0") {
+        cparams.type_k = GGML_TYPE_Q4_0;
+        cparams.type_v = GGML_TYPE_Q4_0;
+    } else {
+        // "f16" or anything else → default f16
+        cparams.type_k = GGML_TYPE_F16;
+        cparams.type_v = GGML_TYPE_F16;
+    }
+
+    // n_threads: 0 means auto (physical cores); set explicitly if provided.
+    if (opts.n_threads > 0) {
+        cparams.n_threads       = opts.n_threads;
+        cparams.n_threads_batch = opts.n_threads;
+    }
+
+    ctx_ = llama_new_context_with_model(model_, cparams);
+    if (!ctx_) {
+        WF_LOG_ERROR("LlmService: failed to create context");
+        llama_model_free(model_);
+        model_ = nullptr;
+        vocab_ = nullptr;
+        return false;
+    }
+
+    // Load the jinja chat template baked into the model metadata so we can
+    // pass enable_thinking=false (equivalent to `llama-cli -rea off`).
+    chat_templates_ = common_chat_templates_init(model_, /*chat_template_override=*/"");
+    if (!chat_templates_) {
+        WF_LOG_ERROR("LlmService: failed to init chat templates");
+        return false;
+    }
+
+    // Cache the special token IDs used by build_tokens_. These are single
+    // tokens in the Qwen3.5 vocab; tokenize_text_ with parse_special=true
+    // returns a 1-element vector for each.
+    auto tok_single = [&](const std::string& s) -> llama_token {
+        auto v = tokenize_text_(s);
+        return v.size() == 1 ? v[0] : LLAMA_TOKEN_NULL;
+    };
+    tok_im_start_ = tok_single("<|im_start|>");
+    tok_im_end_   = tok_single("<|im_end|>");
+    if (tok_im_start_ == LLAMA_TOKEN_NULL || tok_im_end_ == LLAMA_TOKEN_NULL) {
+        WF_LOG_ERROR("LlmService: required special tokens <|im_start|>/<|im_end|> not found in vocab");
+        return false;
+    }
+
+    WF_LOG_INFO("LlmService: loaded %s (n_ctx=%u, n_batch=%u, n_threads=%d, thinking=%s, flash_attn=%s, kv_dtype=%s)",
+                model_path.c_str(),
+                llama_n_ctx(ctx_),
+                llama_n_batch(ctx_),
+                llama_n_threads(ctx_),
+                opts.enable_thinking ? "on" : "off",
+                opts.flash_attention_enabled ? "on" : "off",
+                opts.kv_cache_dtype.c_str());
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// LoRA hot-attach / detach  (PLAN.md 11.2.8: measure latency)
+// ---------------------------------------------------------------------------
+
+bool LlmService::attach_lora(const std::string& lora_path, float scale) {
+    if (!ctx_) return false;
+
+    auto t0 = winefox::time::now_us();
+
+    if (!lora_) {
+        lora_ = llama_adapter_lora_init(model_, lora_path.c_str());
+        if (!lora_) {
+            WF_LOG_ERROR("LlmService: llama_adapter_lora_init failed: %s", lora_path.c_str());
+            return false;
+        }
+    }
+
+    llama_adapter_lora* adapters[1] = { lora_ };
+    float scales[1] = { scale };
+    if (llama_set_adapters_lora(ctx_, adapters, 1, scales) != 0) {
+        WF_LOG_ERROR("LlmService: llama_set_adapters_lora failed");
+        return false;
+    }
+
+    lora_attached_ = true;
+    lora_scale_    = scale;
+
+    auto t1 = winefox::time::now_us();
+    last_perf_.lora_attach_ms = (t1 - t0) / 1000.0;
+    WF_LOG_INFO("LlmService: LoRA attached (scale=%.2f) in %.1f ms",
+                scale, last_perf_.lora_attach_ms);
+    return true;
+}
+
+void LlmService::detach_lora() {
+    if (!ctx_ || !lora_attached_) return;
+
+    auto t0 = winefox::time::now_us();
+
+    // Passing nullptr / 0 clears all active LoRA adapters on the context.
+    llama_set_adapters_lora(ctx_, nullptr, 0, nullptr);
+    lora_attached_ = false;
+
+    auto t1 = winefox::time::now_us();
+    last_perf_.lora_detach_ms = (t1 - t0) / 1000.0;
+    WF_LOG_INFO("LlmService: LoRA detached in %.1f ms", last_perf_.lora_detach_ms);
+}
+
+// ---------------------------------------------------------------------------
+// apply_chat_template_
+// ---------------------------------------------------------------------------
+
+std::string LlmService::apply_chat_template_(const std::vector<memory::Message>& messages,
+                                              bool add_ass) {
+    if (!chat_templates_) {
+        WF_LOG_ERROR("LlmService: chat templates not initialised");
+        return {};
+    }
+
+    // Convert our internal Message type into common_chat_msg.
+    std::vector<common_chat_msg> chat;
+    chat.reserve(messages.size());
+    for (const auto& m : messages) {
+        common_chat_msg msg;
+        msg.role    = m.role;
+        msg.content = m.content;
+        chat.push_back(std::move(msg));
+    }
+
+    common_chat_templates_inputs inputs;
+    inputs.messages           = std::move(chat);
+    inputs.add_generation_prompt = add_ass;
+    inputs.enable_thinking    = opts_.enable_thinking;
+
+    common_chat_params params = common_chat_templates_apply(chat_templates_.get(), inputs);
+    return params.prompt;
+}
+
+// ---------------------------------------------------------------------------
+// tokenize_
+// ---------------------------------------------------------------------------
+
+std::vector<llama_token> LlmService::tokenize_(const std::string& text) {
+    std::vector<llama_token> tokens(128);
+    int n = llama_tokenize(vocab_, text.c_str(), static_cast<int>(text.size()),
+                           tokens.data(), static_cast<int>(tokens.size()),
+                           /*add_special=*/true, /*parse_special=*/true);
+    if (n < 0) {
+        tokens.resize(static_cast<size_t>(-n));
+        n = llama_tokenize(vocab_, text.c_str(), static_cast<int>(text.size()),
+                           tokens.data(), static_cast<int>(tokens.size()),
+                           true, true);
+    }
+    if (n <= 0) return {};
+    tokens.resize(static_cast<size_t>(n));
+    return tokens;
+}
+
+// ---------------------------------------------------------------------------
+// tokenize_text_  (add_special=false, parse_special=true)
+// ---------------------------------------------------------------------------
+
+std::vector<llama_token> LlmService::tokenize_text_(const std::string& text) {
+    if (text.empty()) return {};
+    std::vector<llama_token> tokens(128);
+    int n = llama_tokenize(vocab_, text.c_str(), static_cast<int>(text.size()),
+                           tokens.data(), static_cast<int>(tokens.size()),
+                           /*add_special=*/false, /*parse_special=*/true);
+    if (n < 0) {
+        tokens.resize(static_cast<size_t>(-n));
+        n = llama_tokenize(vocab_, text.c_str(), static_cast<int>(text.size()),
+                           tokens.data(), static_cast<int>(tokens.size()),
+                           false, true);
+    }
+    if (n <= 0) return {};
+    tokens.resize(static_cast<size_t>(n));
+    return tokens;
+}
+
+// ---------------------------------------------------------------------------
+// build_tokens_  (BPE-stable prompt construction for KV cache reuse)
+// ---------------------------------------------------------------------------
+
+std::vector<llama_token> LlmService::build_tokens_(const std::vector<memory::Message>& messages) {
+    std::vector<llama_token> tokens;
+
+    for (const auto& m : messages) {
+        // --- Header: <|im_start|>{role}\n ---
+        // Tokenise "<|im_start|>{role}\n" as a single string so parse_special
+        // picks up <|im_start|> as one token and BPE handles role+\n.
+        std::string header = "<|im_start|>" + m.role + "\n";
+        auto hdr_toks = tokenize_text_(header);
+        tokens.insert(tokens.end(), hdr_toks.begin(), hdr_toks.end());
+
+        // --- Content ---
+        if (m.is_assistant() && !m.gen_tokens.empty()) {
+            // Use the model-generated token IDs directly. The trailing EOG
+            // token (== <|im_end|>) is excluded because we append <|im_end|>
+            // as part of the footer below — this keeps the footer layout
+            // identical across assistant and non-assistant messages.
+            size_t n = m.gen_tokens.size();
+            if (llama_vocab_is_eog(vocab_, m.gen_tokens.back())) {
+                tokens.insert(tokens.end(), m.gen_tokens.begin(), m.gen_tokens.end() - 1);
+            } else {
+                tokens.insert(tokens.end(), m.gen_tokens.begin(), m.gen_tokens.end());
+            }
+        } else {
+            auto content_toks = tokenize_text_(m.content);
+            tokens.insert(tokens.end(), content_toks.begin(), content_toks.end());
+        }
+
+        // --- Footer: <|im_end|>\n ---
+        tokens.push_back(tok_im_end_);
+        auto nl_toks = tokenize_text_("\n");
+        tokens.insert(tokens.end(), nl_toks.begin(), nl_toks.end());
+    }
+
+    // --- Generation prompt: <|im_start|>assistant\n [<think>\n\n</think>\n\n] ---
+    auto gen_hdr = tokenize_text_("<|im_start|>assistant\n");
+    tokens.insert(tokens.end(), gen_hdr.begin(), gen_hdr.end());
+    if (!opts_.enable_thinking) {
+        auto bridge = tokenize_text_("<think>\n\n</think>\n\n");
+        tokens.insert(tokens.end(), bridge.begin(), bridge.end());
+    }
+
+    return tokens;
+}
+
+// ---------------------------------------------------------------------------
+// prefill_tokens_
+// ---------------------------------------------------------------------------
+
+bool LlmService::prefill_tokens_(const std::vector<llama_token>& tokens, size_t start) {
+    int n = static_cast<int>(tokens.size() - start);
+    if (n <= 0) return true;
+
+    const uint32_t n_batch = llama_n_batch(ctx_);
+
+    // Chunked prefill. llama_batch_get_one with pos=nullptr auto-sets positions
+    // from memory->seq_pos_max(0)+1, so incremental prefill works correctly
+    // when KV cache is not cleared.
+    for (int i = 0; i < n; i += static_cast<int>(n_batch)) {
+        int32_t chunk = std::min(static_cast<int>(n_batch), n - i);
+        llama_batch batch = llama_batch_get_one(
+            const_cast<llama_token*>(tokens.data()) + start + i, chunk);
+        int32_t rc = llama_decode(ctx_, batch);
+        if (rc != 0) {
+            WF_LOG_ERROR("LlmService: llama_decode failed during prefill (rc=%d, offset=%d)", rc, i);
+            return false;
+        }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// generate_loop_
+// ---------------------------------------------------------------------------
+
+void LlmService::generate_loop_(const std::function<bool(const std::string&)>& on_token,
+                                 const SamplingParams& sp,
+                                 std::vector<llama_token>* generated_tokens) {
+    // Build the sampler chain: penalties → top_k → top_p → temp → dist.
+    llama_sampler_chain_params scparams = llama_sampler_chain_default_params();
+    scparams.no_perf = true;
+    llama_sampler* smpl = llama_sampler_chain_init(scparams);
+
+    if (sp.penalty_last_n != 0) {
+        llama_sampler_chain_add(smpl, llama_sampler_init_penalties(
+            sp.penalty_last_n, sp.repeat_penalty, 1.0f, 1.0f));
+    }
+    if (sp.top_k > 0) {
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(sp.top_k));
+    }
+    if (sp.top_p < 1.0f) {
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_p(sp.top_p, 1));
+    }
+    // temp == 0 means greedy decoding. With top_k=1 this is already greedy,
+    // so we skip the temp sampler entirely (temp=0 would zero out logits
+    // and break argmax). temp < 1 (but > 0) sharpens the distribution.
+    if (sp.temp > 0.0f && sp.temp != 1.0f) {
+        llama_sampler_chain_add(smpl, llama_sampler_init_temp(sp.temp));
+    }
+    // When temp == 0 (greedy), skip the stochastic dist sampler and use
+    // greedy argmax instead. This makes output fully deterministic.
+    if (sp.temp == 0.0f) {
+        llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
+    } else {
+        llama_sampler_chain_add(smpl, llama_sampler_init_dist(sp.seed));
+    }
+
+    char piece_buf[128];
+    int32_t n_eval = 0;
+    double  t_eval_ms = 0.0;
+
+    while (n_eval < sp.max_tokens) {
+        // Sample from the logits of the last token in the context.
+        llama_token id = llama_sampler_sample(smpl, ctx_, -1);
+
+        // End-of-generation token → stop.
+        if (llama_vocab_is_eog(vocab_, id)) {
+            // Include the EOG token in generated_tokens so the cache stays
+            // aligned with the next turn's prompt (which includes <|im_end|>).
+            if (generated_tokens) {
+                generated_tokens->push_back(id);
+            }
+            break;
+        }
+
+        if (generated_tokens) {
+            generated_tokens->push_back(id);
+        }
+
+        // Convert token → UTF-8 piece.
+        // Use special=true so that special tokens like <think>/</think>
+        // are rendered as text. This is critical for KV cache reuse:
+        // the model may emit an empty <think>\n</think>\n block even
+        // with enable_thinking=false. With special=false these tokens
+        // produce empty strings, so the cached token sequence diverges
+        // from the next turn's re-tokenised prompt. With special=true
+        // the caller can filter them from display while preserving the
+        // full token sequence in short-term memory.
+        int32_t pn = llama_token_to_piece(vocab_, id,
+                                          piece_buf, sizeof(piece_buf),
+                                          /*lstrip=*/0, /*special=*/true);
+        if (pn < 0) {
+            // Buffer too small; re-allocate and retry.
+            std::vector<char> bigbuf(static_cast<size_t>(-pn));
+            pn = llama_token_to_piece(vocab_, id,
+                                      bigbuf.data(), static_cast<int32_t>(bigbuf.size()),
+                                      0, true);
+            if (pn > 0) {
+                std::string piece(bigbuf.data(), static_cast<size_t>(pn));
+                if (!on_token(piece)) break;
+            }
+        } else if (pn > 0) {
+            std::string piece(piece_buf, static_cast<size_t>(pn));
+            if (!on_token(piece)) break;
+        }
+
+        // Feed the sampled token back for the next decode step.
+        llama_batch batch = llama_batch_get_one(&id, 1);
+        auto t0 = winefox::time::now_us();
+        int32_t rc = llama_decode(ctx_, batch);
+        auto t1 = winefox::time::now_us();
+        t_eval_ms += (t1 - t0) / 1000.0;
+
+        if (rc != 0) {
+            WF_LOG_ERROR("LlmService: llama_decode failed during generation (rc=%d)", rc);
+            break;
+        }
+
+        ++n_eval;
+    }
+
+    llama_sampler_free(smpl);
+
+    last_perf_.n_eval      = n_eval;
+    last_perf_.t_eval_ms   = t_eval_ms;
+}
+
+// ---------------------------------------------------------------------------
+// chat_stream  (with KV cache reuse)
+// ---------------------------------------------------------------------------
+
+void LlmService::chat_stream(const std::vector<memory::Message>& messages,
+                              const std::function<bool(const std::string&)>& on_token,
+                              const SamplingParams& sp,
+                              std::vector<llama_token>* out_gen_tokens) {
+    if (!ready()) {
+        WF_LOG_ERROR("LlmService: chat_stream called before load_base");
+        return;
+    }
+
+    last_perf_.n_eval       = 0;
+    last_perf_.t_eval_ms    = 0.0;
+    last_perf_.t_prefill_ms = 0.0;
+
+    // Build the prompt token sequence directly (bypassing the jinja template)
+    // so that assistant messages use their stored gen_tokens. This guarantees
+    // BPE-stable alignment with cached_tokens_ from the previous turn.
+    std::vector<llama_token> new_tokens = build_tokens_(messages);
+    if (new_tokens.empty()) {
+        WF_LOG_ERROR("LlmService: build_tokens_ returned 0 tokens");
+        return;
+    }
+
+    // --- Find common prefix with cached tokens ---
+    size_t common = 0;
+    if (cache_valid_) {
+        size_t min_len = std::min(new_tokens.size(), cached_tokens_.size());
+        while (common < min_len && new_tokens[common] == cached_tokens_[common]) {
+            ++common;
+        }
+    }
+
+    const char* cache_status = cache_valid_
+        ? (common == cached_tokens_.size() ? "INCREMENTAL" : "PARTIAL")
+        : "FIRST";
+
+    auto t0 = winefox::time::now_us();
+
+    if (cache_valid_ && common > 0) {
+        if (common < cached_tokens_.size()) {
+            llama_memory_seq_rm(llama_get_memory(ctx_), 0,
+                                static_cast<int32_t>(common), -1);
+        }
+        if (common < new_tokens.size()) {
+            if (!prefill_tokens_(new_tokens, common)) {
+                WF_LOG_ERROR("LlmService: incremental prefill failed");
+                return;
+            }
+        }
+    } else {
+        llama_memory_clear(llama_get_memory(ctx_), true);
+        if (!prefill_tokens_(new_tokens, 0)) {
+            WF_LOG_ERROR("LlmService: full prefill failed");
+            return;
+        }
+    }
+
+    auto t1 = winefox::time::now_us();
+    last_perf_.t_prefill_ms = (t1 - t0) / 1000.0;
+
+    // --- Generate ---
+    std::vector<llama_token> generated;
+    generate_loop_(on_token, sp, &generated);
+
+    // --- Remove the <think> bridge from new_tokens and KV cache ---
+    // When enable_thinking=false, build_tokens_ appends an empty
+    // <think>\n\n</think>\n\n block to the generation prompt. These bridge
+    // tokens are in new_tokens (and the KV cache) but absent from the next
+    // turn's prompt (build_tokens_ renders historical assistant messages
+    // without a <think> prefix). We remove them from both the KV cache and
+    // new_tokens, then re-prefill the generated tokens so their KV entries
+    // sit at the correct positions. This makes cached_tokens_ align exactly
+    // with the next turn's new_tokens prefix, enabling INCREMENTAL reuse.
+    if (!opts_.enable_thinking && new_tokens.size() >= 2) {
+        // <think> is a single special token in the Qwen3.5 vocab.
+        llama_token think_tok = LLAMA_TOKEN_NULL;
+        auto tv = tokenize_text_("<think>");
+        if (tv.size() == 1) think_tok = tv[0];
+
+        if (think_tok != LLAMA_TOKEN_NULL) {
+            // Search backwards for the <think> token (the generation prompt
+            // is at the very end of new_tokens, so the last <think> is the
+            // bridge).
+            size_t think_pos = new_tokens.size();
+            for (size_t i = new_tokens.size(); i > 0; --i) {
+                if (new_tokens[i - 1] == think_tok) {
+                    think_pos = i - 1;
+                    break;
+                }
+            }
+            if (think_pos < new_tokens.size()) {
+                int32_t bridge_start = static_cast<int32_t>(think_pos);
+                int32_t bridge_size  = static_cast<int32_t>(new_tokens.size() - think_pos);
+                llama_memory_t mem = llama_get_memory(ctx_);
+                // Clear KV cache from bridge_start to the end (removes both
+                // the bridge tokens and the generated tokens' KV entries).
+                llama_memory_seq_rm(mem, 0, bridge_start, -1);
+                // Re-prefill the generated tokens so their KV entries are at
+                // positions [bridge_start, bridge_start + generated.size()).
+                // After the rm above, seq_pos_max(0) = bridge_start - 1, so
+                // llama_batch_get_one auto-assigns positions from bridge_start.
+                if (!generated.empty()) {
+                    if (!prefill_tokens_(generated, 0)) {
+                        WF_LOG_ERROR("LlmService: bridge re-prefill failed");
+                    }
+                }
+                new_tokens.erase(new_tokens.begin() + bridge_start, new_tokens.end());
+                WF_LOG_DEBUG("KV: removed <think> bridge (%d tokens at %d), re-prefilled %zu generated",
+                             bridge_size, bridge_start, generated.size());
+            }
+        }
+    }
+
+    // --- Update cache for next turn ---
+    // cached_tokens_ = new_tokens (bridge removed) + generated (incl. EOG).
+    // The next turn's build_tokens_ renders historical assistant messages as:
+    //   <|im_start|>assistant\n {gen_tokens (excl. EOG)} <|im_end|> \n
+    // which exactly matches cached_tokens_:
+    //   <|im_start|>assistant\n {gen_tokens (excl. EOG)} <|im_end| (=EOG)
+    // followed by the next user message's \n prefix — so the common prefix
+    // extends through the EOG token, yielding INCREMENTAL reuse.
+    cached_tokens_ = new_tokens;
+    cached_tokens_.insert(cached_tokens_.end(), generated.begin(), generated.end());
+    cache_valid_ = true;
+
+    // Hand the generated tokens to the caller for BPE-stable storage.
+    if (out_gen_tokens) {
+        *out_gen_tokens = std::move(generated);
+    }
+
+    WF_LOG_INFO("LlmService: %s prefill %.0f ms (new=%zu cached=%zu common=%zu), %d tokens in %.0f ms (%.1f tok/s)",
+                cache_status,
+                last_perf_.t_prefill_ms,
+                new_tokens.size(), cached_tokens_.size(), common,
+                last_perf_.n_eval,
+                last_perf_.t_eval_ms,
+                last_perf_.tokens_per_sec());
+}
+
+// ---------------------------------------------------------------------------
+// complete  (non-streaming, used by the distiller)
+// ---------------------------------------------------------------------------
+
+bool LlmService::complete(const std::string& prompt, std::string& out,
+                           const SamplingParams& sp) {
+    if (!ready()) {
+        WF_LOG_ERROR("LlmService: complete called before load_base");
+        return false;
+    }
+
+    last_perf_.n_eval       = 0;
+    last_perf_.t_eval_ms    = 0.0;
+    last_perf_.t_prefill_ms = 0.0;
+
+    // Wrap the raw prompt into a single-turn chat so the Instruct model
+    // produces well-formed output.
+    std::vector<memory::Message> msgs = {
+        { "user", prompt, "", "", 0 }
+    };
+    std::string formatted = apply_chat_template_(msgs, /*add_ass=*/true);
+    if (formatted.empty()) {
+        WF_LOG_ERROR("LlmService: complete() chat template failed");
+        return false;
+    }
+
+    std::vector<llama_token> tokens = tokenize_(formatted);
+    if (tokens.empty()) {
+        WF_LOG_ERROR("LlmService: complete() tokenisation failed");
+        return false;
+    }
+
+    // Distiller uses a different prompt prefix, so always full prefill.
+    llama_memory_clear(llama_get_memory(ctx_), true);
+
+    auto t0 = winefox::time::now_us();
+    if (!prefill_tokens_(tokens, 0)) {
+        WF_LOG_ERROR("LlmService: complete() prefill failed");
+        return false;
+    }
+    auto t1 = winefox::time::now_us();
+    last_perf_.t_prefill_ms = (t1 - t0) / 1000.0;
+
+    out.clear();
+    generate_loop_([&out](const std::string& piece) -> bool {
+        out += piece;
+        return true;
+    }, sp, nullptr);
+
+    // Distiller changes the prompt context; invalidate chat cache so the
+    // next chat_stream() does a full re-prefill.
+    cache_valid_ = false;
+
+    WF_LOG_INFO("LlmService: complete() %d tokens in %.0f ms (%.1f tok/s)",
+                last_perf_.n_eval,
+                last_perf_.t_eval_ms,
+                last_perf_.tokens_per_sec());
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// close / destructor
+// ---------------------------------------------------------------------------
+
+void LlmService::close() {
+    lora_attached_ = false;
+    if (lora_) {
+        llama_adapter_lora_free(lora_);
+        lora_ = nullptr;
+    }
+    chat_templates_.reset();
+    if (ctx_) {
+        llama_free(ctx_);
+        ctx_ = nullptr;
+    }
+    if (model_) {
+        llama_model_free(model_);
+        model_ = nullptr;
+        vocab_ = nullptr;
+    }
+}
+
+LlmService::~LlmService() { close(); }
+
+} // namespace llm
+} // namespace winefox
