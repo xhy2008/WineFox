@@ -39,6 +39,7 @@ bool Config::load(const std::string& path) {
     if (j.contains("llm") && j["llm"].is_object()) {
         const auto& l = j["llm"];
         if (l.contains("model_path"))      llm.model_path      = l["model_path"].get<std::string>();
+        if (l.contains("mmproj_path"))     llm.mmproj_path     = l["mmproj_path"].get<std::string>();
         if (l.contains("lora_path"))       llm.lora_path       = l["lora_path"].get<std::string>();
         if (l.contains("lora_scale"))      llm.lora_scale      = l["lora_scale"].get<float>();
         if (l.contains("n_ctx"))           llm.n_ctx           = l["n_ctx"].get<int>();
@@ -98,6 +99,7 @@ bool Config::save(const std::string& path) const {
 
     j["llm"] = {
         {"model_path",              llm.model_path},
+        {"mmproj_path",             llm.mmproj_path},
         {"lora_path",               llm.lora_path},
         {"lora_scale",              llm.lora_scale},
         {"n_ctx",                   llm.n_ctx},

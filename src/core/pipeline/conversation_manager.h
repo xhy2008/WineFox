@@ -49,8 +49,11 @@ public:
 
     // Process one user turn. Streams the fox's reply (text only, without the
     // [emotion] tag) via on_token. Returns the full reply text.
+    // If image_paths is non-empty, the images are attached to this user turn
+    // and processed via the vision path (requires mmproj loaded in LlmService).
     std::string chat(const std::string& user_input,
-                     const std::function<bool(const std::string&)>& on_token);
+                     const std::function<bool(const std::string&)>& on_token,
+                     const std::vector<std::string>& image_paths = {});
 
     // Run distillation if the short-term window has overflowed.
     // Returns the new recall_files.id, or -1 if nothing was distilled.

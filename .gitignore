@@ -29,6 +29,9 @@ CMakeUserPresets.json
 logs/
 *.log
 *.log.err
+# Test output files
+tests/*.err
+tests/*.out
 winefox.json
 # OS junk
 Thumbs.db

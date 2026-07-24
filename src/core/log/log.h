@@ -3,9 +3,12 @@
 // WineFox logging facade.
 //
 // Design (PLAN.md 11.2.7): WF_LOG_* macros are no-ops in Release builds and
-// emit to stderr in DEBUG builds. Keeping the implementation dependency-free
-// (no spdlog) avoids pulling a third party just for debug output; we can swap
-// the backend later without touching call sites.
+// emit to stderr in Debug builds. The switch is keyed on NDEBUG (the standard
+// macro CMake defines for Release / RelWithDebInfo and leaves undefined for
+// Debug), so logging works out of the box in a plain `cmake --build --config
+// Debug` without extra -DDEBUG flags. Keeping the implementation
+// dependency-free (no spdlog) avoids pulling a third party just for debug
+// output; we can swap the backend later without touching call sites.
 
 #include <cstdarg>
 #include <cstdio>
@@ -26,7 +29,7 @@ inline void raw(const char* level, const char* fmt, ...) {
 } // namespace log
 } // namespace winefox
 
-#ifdef DEBUG
+#ifndef NDEBUG
   #define WF_LOG_INFO(...)  ::winefox::log::raw("INFO",  __VA_ARGS__)
   #define WF_LOG_WARN(...)  ::winefox::log::raw("WARN",  __VA_ARGS__)
   #define WF_LOG_ERROR(...) ::winefox::log::raw("ERROR", __VA_ARGS__)
@@ -37,3 +40,7 @@ inline void raw(const char* level, const char* fmt, ...) {
   #define WF_LOG_ERROR(...) ((void)0)
   #define WF_LOG_DEBUG(...) ((void)0)
 #endif
+
+// Performance log: emitted in ALL builds (including Release) to stderr.
+// Used for diagnosing latency issues that only reproduce in Release.
+#define WF_LOG_PERF(...)  ::winefox::log::raw("PERF",  __VA_ARGS__)

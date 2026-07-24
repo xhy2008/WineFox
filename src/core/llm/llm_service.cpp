@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <cstring>
 
+#include <mtmd-helper.h>
+
 namespace winefox {
 namespace llm {
 
@@ -14,20 +16,30 @@ namespace llm {
 // Backend lifecycle + log control
 // ---------------------------------------------------------------------------
 
-#ifdef NDEBUG
-// Release: silently swallow all llama.cpp/ggml log output.
+// Swallow all llama.cpp/ggml log output except genuine errors, which are
+// still forwarded to stderr. Applied in BOTH Debug and Release builds: the
+// verbose INFO-level logs (print_info, create_tensor, sched_reserve, ...)
+// are emitted on every load and dominate loading time in Debug due to
+// unoptimised code paths + stderr I/O. They are not useful for everyday
+// debugging, so we suppress them everywhere.
 static void silent_log_cb(ggml_log_level level, const char* text, void* /*user_data*/) {
-    // Still forward genuine errors to stderr so failures are visible.
     if (level >= GGML_LOG_LEVEL_ERROR) {
         std::fputs(text, stderr);
     }
 }
-#endif
+
+// Debug callback: allow INFO-level logs from mtmd to locate vision perf issues.
+static void debug_log_cb(ggml_log_level level, const char* text, void* /*user_data*/) {
+    if (level >= GGML_LOG_LEVEL_INFO) {
+        std::fputs(text, stderr);
+    }
+}
 
 void init_backend() {
-#ifdef NDEBUG
     llama_log_set(silent_log_cb, nullptr);
-#endif
+    // Suppress mtmd/clip verbose logs (clip_model_loader, load_hparams,
+    // get_dummy_batch, etc.) the same way we suppress llama.cpp logs.
+    mtmd_helper_log_set(silent_log_cb, nullptr);
     llama_backend_init();
     // NUMA: distribute memory across sockets. Safe no-op on single-socket
     // systems; helps multi-socket servers with large models.
@@ -295,11 +307,10 @@ std::vector<llama_token> LlmService::build_tokens_(const std::vector<memory::Mes
     // The <think> bridge: when enable_thinking=false, the Qwen3.5 generation
     // prompt ends with <think>\n\n</think>\n\n. The model generates content
     // AFTER this bridge. By including the bridge in BOTH the generation prompt
-    // AND historical assistant messages, cached_tokens_ (which ends with
-    // bridge + generated) aligns exactly with the next turn's new_tokens
-    // (where the historical assistant is rendered as bridge + gen_tokens +
-    // <|im_end|>). This eliminates the need to remove the bridge and re-prefill
-    // generated tokens every turn.
+    // AND historical assistant messages, n_cached_kv_ (which covers
+    // bridge + generated) aligns exactly with the next turn's build_tokens_
+    // output (where the historical assistant is rendered as bridge + gen_tokens
+    // + <|im_end|>). Since EOG == <|im_end|>, the positions match perfectly.
     std::vector<llama_token> bridge_toks;
     if (!opts_.enable_thinking) {
         bridge_toks = tokenize_text_("<think>\n\n</think>\n\n");
@@ -332,10 +343,17 @@ std::vector<llama_token> LlmService::build_tokens_(const std::vector<memory::Mes
             tokens.insert(tokens.end(), content_toks.begin(), content_toks.end());
         }
 
-        // --- Footer: <|im_end|>\n ---
+        // --- Footer: <|im_end|>[\n] ---
+        // For assistant messages with gen_tokens, the model stops at EOG
+        // (== <|im_end|>) — there is no trailing \n in the KV cache. We
+        // omit the \n so build_tokens_ output matches the cached sequence
+        // exactly. Other messages (user/system/tool) are prefilled with
+        // their full text including the trailing \n.
         tokens.push_back(tok_im_end_);
-        auto nl_toks = tokenize_text_("\n");
-        tokens.insert(tokens.end(), nl_toks.begin(), nl_toks.end());
+        if (!(m.is_assistant() && !m.gen_tokens.empty())) {
+            auto nl_toks = tokenize_text_("\n");
+            tokens.insert(tokens.end(), nl_toks.begin(), nl_toks.end());
+        }
     }
 
     // --- Generation prompt (optional): <|im_start|>assistant\n [<think>...] ---
@@ -351,11 +369,88 @@ std::vector<llama_token> LlmService::build_tokens_(const std::vector<memory::Mes
 }
 
 // ---------------------------------------------------------------------------
-// prefill_tokens_
+// build_tokens_split_  (split token sequence at image marker for vision path)
 // ---------------------------------------------------------------------------
 
-bool LlmService::prefill_tokens_(const std::vector<llama_token>& tokens, size_t start) {
-    int n = static_cast<int>(tokens.size() - start);
+LlmService::TokenSplit LlmService::build_tokens_split_(
+    const std::vector<memory::Message>& messages,
+    int image_user_idx) {
+
+    TokenSplit result;
+    auto& before = result.before;
+    auto& after  = result.after;
+
+    std::vector<llama_token> bridge_toks;
+    if (!opts_.enable_thinking) {
+        bridge_toks = tokenize_text_("<think>\n\n</think>\n\n");
+    }
+
+    auto nl_toks = tokenize_text_("\n");
+
+    for (int msg_idx = 0; msg_idx < static_cast<int>(messages.size()); ++msg_idx) {
+        const auto& m = messages[msg_idx];
+
+        // Tokens before the image marker go to `before`; after go to `after`.
+        // The split point is at the image_user_idx message's footer: header
+        // + content → before, footer → after.
+        std::vector<llama_token>* target = &before;
+        if (msg_idx > image_user_idx) {
+            target = &after;
+        }
+
+        // --- Header ---
+        std::string header = "<|im_start|>" + m.role + "\n";
+        auto hdr_toks = tokenize_text_(header);
+        target->insert(target->end(), hdr_toks.begin(), hdr_toks.end());
+
+        // --- Content ---
+        if (m.is_assistant() && !m.gen_tokens.empty()) {
+            if (!bridge_toks.empty()) {
+                target->insert(target->end(), bridge_toks.begin(), bridge_toks.end());
+            }
+            if (llama_vocab_is_eog(vocab_, m.gen_tokens.back())) {
+                target->insert(target->end(), m.gen_tokens.begin(), m.gen_tokens.end() - 1);
+            } else {
+                target->insert(target->end(), m.gen_tokens.begin(), m.gen_tokens.end());
+            }
+        } else {
+            auto content_toks = tokenize_text_(m.content);
+            target->insert(target->end(), content_toks.begin(), content_toks.end());
+        }
+
+        // --- Footer ---
+        // At the split point (image_user_idx), footer goes to `after`.
+        // This is where image embeddings will be inserted (between before's
+        // last token and after's first token).
+        std::vector<llama_token>* footer_target = target;
+        if (msg_idx == image_user_idx) {
+            footer_target = &after;
+        }
+
+        footer_target->push_back(tok_im_end_);
+        // Assistant messages with gen_tokens: no \n (matches KV cache).
+        // Other messages: include \n.
+        if (!(m.is_assistant() && !m.gen_tokens.empty())) {
+            footer_target->insert(footer_target->end(), nl_toks.begin(), nl_toks.end());
+        }
+    }
+
+    // --- Generation prompt → after ---
+    auto gen_hdr = tokenize_text_("<|im_start|>assistant\n");
+    after.insert(after.end(), gen_hdr.begin(), gen_hdr.end());
+    if (!bridge_toks.empty()) {
+        after.insert(after.end(), bridge_toks.begin(), bridge_toks.end());
+    }
+
+    return result;
+}
+// ---------------------------------------------------------------------------
+
+bool LlmService::prefill_tokens_(const std::vector<llama_token>& tokens,
+                                  size_t token_start,
+                                  llama_pos pos_start,
+                                  bool logits_last) {
+    int n = static_cast<int>(tokens.size() - token_start);
     if (n <= 0) return true;
 
     const uint32_t n_batch = llama_n_batch(ctx_);
@@ -364,21 +459,20 @@ bool LlmService::prefill_tokens_(const std::vector<llama_token>& tokens, size_t 
     // overhead of llama_batch_get_one (which calls memory->seq_pos_max() and
     // builds pos/seq_id arrays on every decode call).
     //
-    // Position = start + i: for full prefill (start=0, KV cleared) positions
-    // are 0,1,2,...; for incremental prefill (start=common) positions are
-    // common,common+1,... which matches the existing KV cache prefix.
+    // Position = pos_start + i: for full prefill (pos_start=0, KV cleared)
+    // positions are 0,1,2,...; for incremental prefill positions continue
+    // from the existing KV cache prefix.
     for (int i = 0; i < n; i += static_cast<int>(n_batch)) {
         int32_t chunk = std::min(static_cast<int>(n_batch), n - i);
 
         llama_batch batch = llama_batch_init(chunk, /*embd=*/0, /*n_seq_max=*/1);
         for (int32_t j = 0; j < chunk; ++j) {
-            batch.token[j]    = tokens[start + i + j];
-            batch.pos[j]      = static_cast<int32_t>(start + i + j);
+            batch.token[j]    = tokens[token_start + i + j];
+            batch.pos[j]      = pos_start + i + j;
             batch.n_seq_id[j] = 1;
             batch.seq_id[j][0] = 0;
-            // Only request logits for the last token in the final chunk
-            // (needed for sampling). This reduces output buffer usage.
-            batch.logits[j] = (i + j == n - 1) ? 1 : 0;
+            // Only request logits for the last token (needed for sampling).
+            batch.logits[j] = (logits_last && i + j == n - 1) ? 1 : 0;
         }
         batch.n_tokens = chunk;
 
@@ -510,7 +604,7 @@ double LlmService::warmup_prefill(const std::vector<memory::Message>& messages) 
 
     // Build tokens WITHOUT generation prompt — this is just the static prefix
     // (system message). The first chat_stream() will append user messages +
-    // generation prompt, and the common prefix will match these tokens.
+    // generation prompt, and the prefix will match these tokens.
     std::vector<llama_token> new_tokens = build_tokens_(messages, /*add_gen_prompt=*/false);
     if (new_tokens.empty()) {
         WF_LOG_ERROR("LlmService: warmup build_tokens_ returned 0 tokens");
@@ -521,19 +615,21 @@ double LlmService::warmup_prefill(const std::vector<memory::Message>& messages) 
     llama_memory_clear(llama_get_memory(ctx_), true);
 
     auto t0 = winefox::time::now_us();
-    if (!prefill_tokens_(new_tokens, 0)) {
+    if (!prefill_tokens_(new_tokens, 0, 0)) {
         WF_LOG_ERROR("LlmService: warmup prefill failed");
         return -1.0;
     }
     auto t1 = winefox::time::now_us();
     double prefill_ms = (t1 - t0) / 1000.0;
 
-    // Store in cached_tokens_ so the next chat_stream() does INCREMENTAL reuse.
-    cached_tokens_ = std::move(new_tokens);
-    cache_valid_   = true;
+    // Track cached positions for incremental reuse. No images in warmup,
+    // so n_cached_tokens_ == n_cached_kv_.
+    n_cached_tokens_ = static_cast<llama_pos>(new_tokens.size());
+    n_cached_kv_     = n_cached_tokens_;
 
     WF_LOG_INFO("LlmService: warmup prefill %zu tokens in %.0f ms",
-                cached_tokens_.size(), prefill_ms);
+                new_tokens.size(), prefill_ms);
+
     return prefill_ms;
 }
 
@@ -544,9 +640,16 @@ double LlmService::warmup_prefill(const std::vector<memory::Message>& messages) 
 void LlmService::chat_stream(const std::vector<memory::Message>& messages,
                               const std::function<bool(const std::string&)>& on_token,
                               const SamplingParams& sp,
-                              std::vector<llama_token>* out_gen_tokens) {
+                              std::vector<llama_token>* out_gen_tokens,
+                              const std::vector<std::string>& image_paths) {
     if (!ready()) {
         WF_LOG_ERROR("LlmService: chat_stream called before load_base");
+        return;
+    }
+
+    // --- Vision path: images present and mmproj loaded ---
+    if (!image_paths.empty() && vision_.ready()) {
+        chat_stream_with_images_(messages, image_paths, on_token, sp, out_gen_tokens);
         return;
     }
 
@@ -556,42 +659,44 @@ void LlmService::chat_stream(const std::vector<memory::Message>& messages,
 
     // Build the prompt token sequence directly (bypassing the jinja template)
     // so that assistant messages use their stored gen_tokens. This guarantees
-    // BPE-stable alignment with cached_tokens_ from the previous turn.
+    // the sequence is a deterministic extension of the previous turn's cached
+    // prefix, enabling position-pointer-based KV cache reuse.
     std::vector<llama_token> new_tokens = build_tokens_(messages);
     if (new_tokens.empty()) {
         WF_LOG_ERROR("LlmService: build_tokens_ returned 0 tokens");
         return;
     }
 
-    // --- Find common prefix with cached tokens ---
-    size_t common = 0;
-    if (cache_valid_) {
-        size_t min_len = std::min(new_tokens.size(), cached_tokens_.size());
-        while (common < min_len && new_tokens[common] == cached_tokens_[common]) {
-            ++common;
-        }
-    }
-
-    const char* cache_status = cache_valid_
-        ? (common == cached_tokens_.size() ? "INCREMENTAL" : "PARTIAL")
-        : "FIRST";
+    // --- Incremental prefill using dual position pointers ---
+    // n_cached_tokens_: how many text tokens of build_tokens_ output are
+    //   already in the KV cache (skip count for token_start).
+    // n_cached_kv_: how many KV positions are cached (pos_start). This may
+    //   be > n_cached_tokens_ if prior turns had images (image embeddings
+    //   occupy KV positions without text tokens).
+    //
+    // build_tokens_ produces identical text token sequences across turns
+    // (assistant messages use stored gen_tokens), so the first
+    // n_cached_tokens_ tokens of new_tokens are guaranteed to match the
+    // cached KV prefix. We only prefill the suffix.
+    const bool can_reuse = (n_cached_tokens_ > 0
+                            && n_cached_tokens_ < static_cast<llama_pos>(new_tokens.size()));
+    const char* cache_status = can_reuse ? "INCREMENTAL"
+                                  : (n_cached_tokens_ > 0 ? "FULL(reset)" : "FULL(first)");
 
     auto t0 = winefox::time::now_us();
 
-    if (cache_valid_ && common > 0) {
-        if (common < cached_tokens_.size()) {
-            llama_memory_seq_rm(llama_get_memory(ctx_), 0,
-                                static_cast<int32_t>(common), -1);
-        }
-        if (common < new_tokens.size()) {
-            if (!prefill_tokens_(new_tokens, common)) {
-                WF_LOG_ERROR("LlmService: incremental prefill failed");
-                return;
-            }
+    if (can_reuse) {
+        // Remove KV positions beyond the cached prefix (from previous
+        // generation), then prefill only the new suffix tokens.
+        llama_memory_seq_rm(llama_get_memory(ctx_), 0, n_cached_kv_, -1);
+        if (!prefill_tokens_(new_tokens, n_cached_tokens_, n_cached_kv_)) {
+            WF_LOG_ERROR("LlmService: incremental prefill failed");
+            return;
         }
     } else {
+        // Full prefill: clear everything and start fresh.
         llama_memory_clear(llama_get_memory(ctx_), true);
-        if (!prefill_tokens_(new_tokens, 0)) {
+        if (!prefill_tokens_(new_tokens, 0, 0)) {
             WF_LOG_ERROR("LlmService: full prefill failed");
             return;
         }
@@ -604,26 +709,245 @@ void LlmService::chat_stream(const std::vector<memory::Message>& messages,
     std::vector<llama_token> generated;
     generate_loop_(on_token, sp, &generated);
 
-    // --- Update cache for next turn ---
-    // No bridge removal needed! build_tokens_ renders historical assistant
-    // messages WITH the <think> bridge prefix, so cached_tokens_ (which ends
-    // with bridge + generated) aligns exactly with the next turn's new_tokens
-    // (where the historical assistant is bridge + gen_tokens + <|im_end|>).
-    // The EOG token (= <|im_end|>) at the end of generated matches the
-    // footer <|im_end|> in the next turn's rendering.
-    cached_tokens_ = new_tokens;
-    cached_tokens_.insert(cached_tokens_.end(), generated.begin(), generated.end());
-    cache_valid_ = true;
+    // --- Update cache pointers for next turn ---
+    // Text path: no images, so n_cached_tokens_ == n_cached_kv_.
+    n_cached_tokens_ = static_cast<llama_pos>(new_tokens.size() + generated.size());
+    n_cached_kv_     = n_cached_tokens_;
 
-    // Hand the generated tokens to the caller for BPE-stable storage.
     if (out_gen_tokens) {
         *out_gen_tokens = std::move(generated);
     }
 
-    WF_LOG_INFO("LlmService: %s prefill %.0f ms (new=%zu cached=%zu common=%zu), %d tokens in %.0f ms (%.1f tok/s)",
+    WF_LOG_PERF("LlmService: %s prefill %.0f ms (new=%zu cached_toks=%d cached_kv=%d), %d tokens in %.0f ms (%.1f tok/s)",
                 cache_status,
                 last_perf_.t_prefill_ms,
-                new_tokens.size(), cached_tokens_.size(), common,
+                new_tokens.size(), static_cast<int>(n_cached_tokens_),
+                static_cast<int>(n_cached_kv_),
+                last_perf_.n_eval,
+                last_perf_.t_eval_ms,
+                last_perf_.tokens_per_sec());
+}
+
+// ---------------------------------------------------------------------------
+// load_vision  (mmproj for image input)
+// ---------------------------------------------------------------------------
+
+bool LlmService::load_vision(const std::string& mmproj_path, const VisionOptions& vopts) {
+    if (!ready()) {
+        WF_LOG_ERROR("LlmService: load_vision called before load_base");
+        return false;
+    }
+    return vision_.load(mmproj_path, model_, vopts);
+}
+
+// ---------------------------------------------------------------------------
+// chat_stream_with_images_  (vision path: build_tokens_split_ + dual-pointer)
+// ---------------------------------------------------------------------------
+
+void LlmService::chat_stream_with_images_(const std::vector<memory::Message>& messages,
+                                            const std::vector<std::string>& image_paths,
+                                            const std::function<bool(const std::string&)>& on_token,
+                                            const SamplingParams& sp,
+                                            std::vector<llama_token>* out_gen_tokens) {
+    last_perf_.n_eval       = 0;
+    last_perf_.t_eval_ms    = 0.0;
+    last_perf_.t_prefill_ms = 0.0;
+
+    // --- Find the last user message (where images will be attached) ---
+    int last_user_idx = -1;
+    for (int i = static_cast<int>(messages.size()) - 1; i >= 0; --i) {
+        if (messages[i].is_user()) {
+            last_user_idx = i;
+            break;
+        }
+    }
+    if (last_user_idx < 0) {
+        WF_LOG_ERROR("LlmService: vision path requires a user message");
+        return;
+    }
+
+    // --- Split text tokens at the image insertion point ---
+    // before: all tokens up to (not including) the last user msg's footer.
+    // after:  last user msg footer + following msgs + generation prompt.
+    // Image embeddings are eval'd between before and after.
+    // before + after (concatenated) == build_tokens_(messages, true), so the
+    // text token sequence is identical to the text path. This enables
+    // cross-turn KV cache reuse even when images were present in prior turns.
+    TokenSplit split = build_tokens_split_(messages, last_user_idx);
+
+    // --- Load bitmaps from image files ---
+    std::vector<mtmd_bitmap*> bitmaps;
+    bitmaps.reserve(image_paths.size());
+    for (const auto& path : image_paths) {
+        mtmd_bitmap* bm = vision_.load_bitmap_from_file(path);
+        if (!bm) {
+            WF_LOG_ERROR("LlmService: failed to load image: %s", path.c_str());
+            for (auto* b : bitmaps) mtmd_bitmap_free(b);
+            return;
+        }
+        bitmaps.push_back(bm);
+    }
+
+    // --- Tokenize images into mtmd chunks ---
+    // Use a marker-only prompt so mtmd produces only image chunks (the empty
+    // text chunks before/after each marker are no-ops during eval). This
+    // keeps text tokenization in build_tokens_split_ (BPE-stable) and image
+    // tokenization in mtmd, completely separated.
+    const char* marker = vision_.media_marker();
+    std::string marker_prompt;
+    for (size_t i = 0; i < bitmaps.size(); ++i) {
+        marker_prompt += marker;
+    }
+    mtmd_input_chunks* chunks = vision_.tokenize(marker_prompt, bitmaps,
+                                                   /*add_special=*/false,
+                                                   /*parse_special=*/true);
+    // Free bitmaps — mtmd has consumed pixel data during tokenize.
+    for (auto* b : bitmaps) mtmd_bitmap_free(b);
+    if (!chunks) {
+        WF_LOG_ERROR("LlmService: vision tokenize failed");
+        return;
+    }
+
+    // Debug: log chunk count and types
+    {
+        size_t n_chunks = mtmd_input_chunks_size(chunks);
+        std::string chunk_info = "chunks=" + std::to_string(n_chunks);
+        for (size_t i = 0; i < n_chunks; ++i) {
+            auto* c = mtmd_input_chunks_get(chunks, i);
+            auto t = mtmd_input_chunk_get_type(c);
+            chunk_info += " [";
+            chunk_info += (t == 0 ? "TEXT" : (t == 1 ? "IMAGE" : "AUDIO"));
+            chunk_info += " n_tok=" + std::to_string(mtmd_input_chunk_get_n_tokens(c));
+            chunk_info += " n_pos=" + std::to_string(mtmd_input_chunk_get_n_pos(c));
+            chunk_info += "]";
+        }
+        WF_LOG_PERF("LlmService: VISION mtmd %s mrope=%d marker=%s",
+                    chunk_info.c_str(),
+                    vision_.use_mrope() ? 1 : 0,
+                    marker);
+    }
+
+    // --- Incremental prefill of 'before' tokens ---
+    // n_cached_tokens_ counts text tokens already in the KV cache (in
+    // build_tokens_ output space). n_cached_kv_ counts KV positions already
+    // cached (includes image embedding positions from prior vision turns).
+    // The first n_cached_tokens_ tokens of split.before are guaranteed to
+    // match the cached prefix (same BPE-stable tokenization as build_tokens_).
+    const bool can_reuse = (n_cached_tokens_ > 0
+                            && n_cached_tokens_ < static_cast<llama_pos>(split.before.size()));
+    const char* cache_status = can_reuse ? "INCREMENTAL"
+                                  : (n_cached_tokens_ > 0 ? "FULL(reset)" : "FULL(first)");
+
+    auto t0 = winefox::time::now_us();
+
+    if (can_reuse) {
+        // Remove KV positions beyond the cached prefix (from previous
+        // generation), then prefill only the new suffix of 'before'.
+        llama_memory_seq_rm(llama_get_memory(ctx_), 0, n_cached_kv_, -1);
+        if (!prefill_tokens_(split.before, n_cached_tokens_, n_cached_kv_,
+                             /*logits_last=*/false)) {
+            WF_LOG_ERROR("LlmService: vision before incremental prefill failed");
+            mtmd_input_chunks_free(chunks);
+            return;
+        }
+    } else {
+        // Full prefill: clear everything and start fresh.
+        llama_memory_clear(llama_get_memory(ctx_), true);
+        if (!split.before.empty()) {
+            if (!prefill_tokens_(split.before, 0, 0, /*logits_last=*/false)) {
+                WF_LOG_ERROR("LlmService: vision before full prefill failed");
+                mtmd_input_chunks_free(chunks);
+                return;
+            }
+        }
+    }
+
+    auto t_before = winefox::time::now_us();
+
+    // KV position after prefilling 'before':
+    // - Full:       before.size()
+    // - Incremental: n_cached_kv_ + (before.size() - n_cached_tokens_)
+    //              = before.size() + (n_cached_kv_ - n_cached_tokens_)
+    // where (n_cached_kv_ - n_cached_tokens_) = total image KV positions
+    // from all prior vision turns (always >= 0).
+    llama_pos image_offset = can_reuse ? (n_cached_kv_ - n_cached_tokens_) : 0;
+    llama_pos n_past = image_offset + static_cast<llama_pos>(split.before.size());
+
+    WF_LOG_PERF("LlmService: VISION prefill before=%zu after=%zu n_cached_toks=%d n_cached_kv=%d image_offset=%d n_past_before_image=%d",
+                split.before.size(), split.after.size(),
+                static_cast<int>(n_cached_tokens_),
+                static_cast<int>(n_cached_kv_),
+                static_cast<int>(image_offset),
+                static_cast<int>(n_past));
+
+    // --- Eval image chunks ---
+    // mtmd_helper_eval_chunks places image embeddings at positions
+    // [n_past, n_past + image_kv_pos). Empty text chunks (from the
+    // marker-only prompt) are no-ops. logits_last=false: we need logits on
+    // the last token of 'after', not on an image.
+    llama_pos new_n_past = 0;
+    int32_t n_batch = static_cast<int32_t>(llama_n_batch(ctx_));
+    if (!vision_.eval_chunks(ctx_, chunks,
+                              /*n_past=*/n_past, /*seq_id=*/0, n_batch,
+                              /*logits_last=*/false, &new_n_past)) {
+        WF_LOG_ERROR("LlmService: vision eval_chunks failed");
+        mtmd_input_chunks_free(chunks);
+        return;
+    }
+    mtmd_input_chunks_free(chunks);
+
+    auto t_image = winefox::time::now_us();
+
+    // new_n_past = n_past + total image KV positions
+    n_past = new_n_past;
+
+    // --- Prefill 'after' tokens (logits_last=true for sampling) ---
+    if (!split.after.empty()) {
+        if (!prefill_tokens_(split.after, 0, n_past, /*logits_last=*/true)) {
+            WF_LOG_ERROR("LlmService: vision after prefill failed");
+            return;
+        }
+        n_past += static_cast<llama_pos>(split.after.size());
+    }
+
+    auto t1 = winefox::time::now_us();
+    last_perf_.t_prefill_ms = (t1 - t0) / 1000.0;
+
+    WF_LOG_PERF("LlmService: VISION timing: before=%.0fms image=%.0fms after=%.0fms total=%.0fms",
+                (t_before - t0) / 1000.0,
+                (t_image - t_before) / 1000.0,
+                (t1 - t_image) / 1000.0,
+                last_perf_.t_prefill_ms);
+
+    // --- Generate ---
+    std::vector<llama_token> generated;
+    generate_loop_(on_token, sp, &generated);
+
+    // --- Update cache pointers ---
+    // n_cached_tokens_: text token count (before + after + generated).
+    //   On the next turn, build_tokens_ produces the same text token
+    //   sequence, so the first n_cached_tokens_ tokens match the cache.
+    // n_cached_kv_: KV position count (before + images + after + generated).
+    //   On the next turn, incremental prefill continues from this position.
+    //   The difference (n_cached_kv_ - n_cached_tokens_) accumulates image
+    //   KV positions across all vision turns.
+    n_cached_tokens_ = static_cast<llama_pos>(split.before.size()
+                                              + split.after.size()
+                                              + generated.size());
+    n_cached_kv_     = n_past + static_cast<llama_pos>(generated.size());
+
+    if (out_gen_tokens) {
+        *out_gen_tokens = std::move(generated);
+    }
+
+    WF_LOG_PERF("LlmService: VISION %s prefill %.0f ms (%zu images, before=%zu after=%zu n_past=%d cached_toks=%d cached_kv=%d), %d tokens in %.0f ms (%.1f tok/s)",
+                cache_status,
+                last_perf_.t_prefill_ms,
+                image_paths.size(),
+                split.before.size(), split.after.size(),
+                static_cast<int>(n_past),
+                static_cast<int>(n_cached_tokens_),
+                static_cast<int>(n_cached_kv_),
                 last_perf_.n_eval,
                 last_perf_.t_eval_ms,
                 last_perf_.tokens_per_sec());
@@ -665,7 +989,7 @@ bool LlmService::complete(const std::string& prompt, std::string& out,
     llama_memory_clear(llama_get_memory(ctx_), true);
 
     auto t0 = winefox::time::now_us();
-    if (!prefill_tokens_(tokens, 0)) {
+    if (!prefill_tokens_(tokens, 0, 0)) {
         WF_LOG_ERROR("LlmService: complete() prefill failed");
         return false;
     }
@@ -678,9 +1002,10 @@ bool LlmService::complete(const std::string& prompt, std::string& out,
         return true;
     }, sp, nullptr);
 
-    // Distiller changes the prompt context; invalidate chat cache so the
-    // next chat_stream() does a full re-prefill.
-    cache_valid_ = false;
+    // Distiller changes the prompt context; invalidate cache so the next
+    // chat_stream() does a full re-prefill. (warmup_prefill is called
+    // afterwards to re-warm the system prompt.)
+    invalidate_cache();
 
     WF_LOG_INFO("LlmService: complete() %d tokens in %.0f ms (%.1f tok/s)",
                 last_perf_.n_eval,
@@ -694,6 +1019,7 @@ bool LlmService::complete(const std::string& prompt, std::string& out,
 // ---------------------------------------------------------------------------
 
 void LlmService::close() {
+    vision_.close();
     lora_attached_ = false;
     if (lora_) {
         llama_adapter_lora_free(lora_);

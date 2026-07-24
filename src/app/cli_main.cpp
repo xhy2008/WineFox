@@ -25,12 +25,14 @@
 //       --kv-dtype <type>     KV cache dtype (f16|q8_0|q4_0)
 //       --thinking <on|off>   Enable/disable <think> mode
 //       --no-lora             Disable LoRA
+//       --mmproj <path>       Multimodal projector (.gguf) for vision input
 //
 // Commands (typed at the prompt):
 //   /quit          Exit
 //   /memory        Show memory status
 //   /reset         Clear short-term context
 //   /distill       Force distillation of the short-term window
+//   /image <path>  Attach image(s) to the next message
 
 #include "../core/config/config.h"
 #include "../core/embedder/embedder_service.h"
@@ -86,6 +88,7 @@ void print_usage() {
         "      --kv-dtype <type>       KV cache dtype (f16|q8_0|q4_0)\n"
         "      --thinking <on|off>     <think> mode\n"
         "      --no-lora               Disable LoRA\n"
+        "      --mmproj <path>         Multimodal projector (.gguf)\n"
         "      --gen-config <path>     Write default config to path and exit\n");
 }
 
@@ -122,6 +125,7 @@ bool parse_args(int argc, char** argv, winefox::config::Config& cfg) {
         else if (a == "--kv-dtype")      cfg.llm.kv_cache_dtype = next();
         else if (a == "--thinking")      cfg.llm.enable_thinking = parse_bool(next());
         else if (a == "--no-lora")       cfg.no_lora = true;
+        else if (a == "--mmproj")        cfg.llm.mmproj_path = next();
         else if (a == "--gen-config") {
             std::string path = next();
             if (cfg.save(path)) {
@@ -245,6 +249,25 @@ int main(int argc, char** argv) {
                 cfg.llm.flash_attention_enabled ? "on" : "off",
                 cfg.llm.kv_cache_dtype.c_str());
 
+    // --- Vision (optional) ---
+    if (!cfg.llm.mmproj_path.empty()) {
+        winefox::llm::VisionOptions vopts;
+        vopts.use_gpu = false;
+        vopts.n_threads = cfg.llm.n_threads;
+        vopts.flash_attn = cfg.llm.flash_attention_enabled;
+        // Use mmproj defaults (Qwen3VL: min=8, max=4096). mtmd-cli with these
+        // defaults encodes test_red.png in ~142ms, so token count is NOT the
+        // bottleneck. The slow path is in our eval_chunks implementation.
+        vopts.image_min_tokens = -1;
+        vopts.image_max_tokens = -1;
+        if (llm.load_vision(cfg.llm.mmproj_path, vopts)) {
+            std::printf("[OK] 视觉模型: %s\n", cfg.llm.mmproj_path.c_str());
+        } else {
+            std::fprintf(stderr, "[WARN] 视觉模型加载失败: %s (视觉功能不可用)\n",
+                         cfg.llm.mmproj_path.c_str());
+        }
+    }
+
     // --- Memory services ---
     winefox::memory::RecallService recall;
     recall.init(&db, &embedder);
@@ -278,13 +301,19 @@ int main(int argc, char** argv) {
     std::printf("\n");
     std::printf("========================================\n");
     std::printf("  酒狐已就绪！输入消息开始对话。\n");
-    std::printf("  命令: /quit  /memory  /reset  /distill\n");
+    std::printf("  命令: /quit  /memory  /reset  /distill  /image\n");
     std::printf("========================================\n\n");
 
     // --- REPL ---
     std::string line;
+    std::vector<std::string> pending_images;  // images queued by /image
     while (true) {
-        std::printf("主人> ");
+        // Show a visual hint when images are queued
+        if (!pending_images.empty()) {
+            std::printf("主人> [%zu 张图片已附加] ", pending_images.size());
+        } else {
+            std::printf("主人> ");
+        }
         std::fflush(stdout);
         if (!std::getline(std::cin, line)) break;  // EOF
 
@@ -299,6 +328,7 @@ int main(int argc, char** argv) {
         }
         if (line == "/reset") {
             conv.reset();
+            pending_images.clear();
             std::printf("[短期记忆已清空]\n\n");
             continue;
         }
@@ -313,8 +343,27 @@ int main(int argc, char** argv) {
             }
             continue;
         }
+        if (line.rfind("/image", 0) == 0) {
+            // /image <path>        — attach one image
+            // /image <p1> <p2>     — attach multiple images
+            // /image clear         — clear pending images
+            std::string args = winefox::strings::trim(line.substr(6));
+            if (args == "clear" || args.empty()) {
+                pending_images.clear();
+                std::printf("[已清除待发送图片]\n\n");
+            } else {
+                // Split by spaces (simple split; paths with spaces need quoting)
+                std::istringstream iss(args);
+                std::string p;
+                while (iss >> p) {
+                    pending_images.push_back(p);
+                }
+                std::printf("[已附加 %zu 张图片，输入消息发送]\n\n", pending_images.size());
+            }
+            continue;
+        }
         if (line[0] == '/') {
-            std::printf("未知命令: %s  (可用: /quit /memory /reset /distill)\n", line.c_str());
+            std::printf("未知命令: %s  (可用: /quit /memory /reset /distill /image)\n", line.c_str());
             continue;
         }
 
@@ -326,7 +375,10 @@ int main(int argc, char** argv) {
             std::fwrite(piece.data(), 1, piece.size(), stdout);
             std::fflush(stdout);
             return true;  // never stop early
-        });
+        }, pending_images);
+
+        // Clear pending images after they've been consumed by this turn.
+        pending_images.clear();
 
         auto perf = llm.last_perf();
         std::printf("\n[perf: %d tokens, %.1f tok/s, prefill %.0f ms]\n\n",

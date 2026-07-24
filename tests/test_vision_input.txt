@@ -1,0 +1,4 @@
+/reset
+/image E:\winefox\tests\test_red.png
+这张图片是什么颜色的？
+/quit

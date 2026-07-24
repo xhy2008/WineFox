@@ -36,7 +36,7 @@ set(LLAMA_BUILD_TOOLS     OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES  OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_SERVER    OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_APP       OFF CACHE BOOL "" FORCE)
-set(LLAMA_BUILD_MTMD      OFF CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_MTMD      ON CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_UI        OFF CACHE BOOL "" FORCE)
 set(LLAMA_USE_PREBUILT_UI OFF CACHE BOOL "" FORCE)
 set(LLAMA_CURL            OFF CACHE BOOL "" FORCE)
@@ -80,6 +80,7 @@ set(WINEFOX_CORE_SOURCES
     src/core/memory/recall.cpp
     src/core/memory/distiller.cpp
     src/core/llm/llm_service.cpp
+    src/core/llm/vision_service.cpp
     src/core/pipeline/conversation_manager.cpp
 )
 
@@ -105,6 +106,7 @@ if(WINEFOX_CORE_SOURCES_AND_HEADERS_EXIST)
         winefox_json
         llama
         llama-common
+        mtmd
     )
     target_include_directories(winefox_core PUBLIC src)
 

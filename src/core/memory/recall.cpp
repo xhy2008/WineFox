@@ -15,6 +15,7 @@ namespace {
 struct SegmentHit {
     long long              seg_id;
     long long              file_id;
+    std::string            title;    // from recall_files (joined)
     std::string            content;
     std::vector<float>     embedding;
     int64_t                created_at;
@@ -60,12 +61,14 @@ std::vector<Recall> RecallService::recall(const std::string& query, int top_k) {
     std::vector<float> q = embedder_->embed(query);
     if (q.empty()) return out;
 
-    // Load every segment. For Phase 1 the memory footprint is small enough
-    // that a linear scan is fine; revisit with an ANN index once it matters.
+    // Load every segment with its file title. For Phase 1 the memory footprint
+    // is small enough that a linear scan is fine; revisit with an ANN index
+    // once it matters.
     std::vector<SegmentHit> hits;
     db_->query(
-        "SELECT id, recall_file_id, content, embedding, created_at "
-        "FROM recall_segments",
+        "SELECT s.id, s.recall_file_id, s.content, s.embedding, s.created_at, f.title "
+        "FROM recall_segments s "
+        "JOIN recall_files f ON s.recall_file_id = f.id",
         {},
         [&](sqlite3_stmt* stmt) {
             SegmentHit h;
@@ -79,6 +82,8 @@ std::vector<Recall> RecallService::recall(const std::string& query, int top_k) {
                     std::string(static_cast<const char*>(blob), blob_sz));
             }
             h.created_at = sqlite3_column_int64(stmt, 4);
+            const unsigned char* t = sqlite3_column_text(stmt, 5);
+            if (t) h.title = reinterpret_cast<const char*>(t);
             h.score      = cosine_(q, h.embedding);
             hits.push_back(std::move(h));
             return true;
@@ -111,6 +116,7 @@ std::vector<Recall> RecallService::recall(const std::string& query, int top_k) {
         if (it == by_file.end()) {
             Recall r;
             r.file_id    = h.file_id;
+            r.title      = h.title;
             r.content    = h.content;
             r.score      = blended;
             r.created_at = h.created_at;

@@ -4,6 +4,7 @@
 #include "../util/time.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <set>
 #include <sstream>
 
@@ -103,30 +104,29 @@ void ConversationManager::build_messages_(std::vector<memory::Message>& messages
     messages.push_back(build_system_message_());
 
     // --- Short-term window (recent turns) ---
-    // Recall is merged into the user message content as a suffix, NOT emitted
-    // as a separate role:tool message. The Qwen3.5 chat template renders
-    // role:tool as <tool_response>...</tool_response>, and those tags are NOT
-    // single special tokens — BPE splits them into ~10+ tokens, which inflates
-    // the non-cached suffix and raises prefill latency from ~600ms to ~1100ms.
-    // Merging recall into the user content costs only 1-2 tokens (\n\n) and
-    // the recall text already starts with "[相关记忆]\n" so the model can
-    // distinguish it from user input.
+    // Recall is emitted as a role:tool message immediately AFTER the user
+    // message that triggered it, NOT merged into user content. This mirrors
+    // the training dataset layout and prevents the model from conflating
+    // recalled memory with what the user actually said. The tool message
+    // is structurally isolated by <|im_start|>tool ... <|im_end|> so the
+    // model can clearly distinguish recall context from user input.
     for (const auto& m : short_term_->all()) {
-        if (m.is_user() && !m.recall.empty()) {
-            std::string merged = m.content + "\n\n" + m.recall;
-            messages.push_back({"user", merged, m.emotion, "", m.timestamp});
+        if (m.is_user()) {
+            messages.push_back({"user", m.content, m.emotion, "", m.timestamp});
+            if (!m.recall.empty()) {
+                messages.push_back({"tool", m.recall, "", "", m.timestamp});
+            }
         } else {
             messages.push_back(m);
         }
     }
 
-    // --- Current user turn (recall merged into user content) ---
+    // --- Current user turn ---
     int64_t now = winefox::time::now_ms() / 1000;
-    std::string merged_input = user_input;
+    messages.push_back({"user", user_input, "", "", now});
     if (!current_recall.empty()) {
-        merged_input += "\n\n" + current_recall;
+        messages.push_back({"tool", current_recall, "", "", now});
     }
-    messages.push_back({"user", merged_input, "", "", now});
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +134,8 @@ void ConversationManager::build_messages_(std::vector<memory::Message>& messages
 // ---------------------------------------------------------------------------
 
 std::string ConversationManager::chat(const std::string& user_input,
-                                       const std::function<bool(const std::string&)>& on_token) {
+                                       const std::function<bool(const std::string&)>& on_token,
+                                       const std::vector<std::string>& image_paths) {
     if (!llm_ || !llm_->ready()) {
         WF_LOG_ERROR("ConvMgr: LLM not ready");
         return {};
@@ -144,6 +145,18 @@ std::string ConversationManager::chat(const std::string& user_input,
     std::string current_recall;
     if (!user_input.empty() && recall_->embedder_ready()) {
         auto recalls = recall_->recall(user_input, cfg_.recall_top_k);
+#ifndef NDEBUG
+        // Debug build: dump the raw recall hits so we can inspect what the
+        // long-term memory actually surfaced for this query.
+        std::fprintf(stderr, "[recall] query=\"%s\" hits=%zu\n",
+                     user_input.c_str(), recalls.size());
+        for (size_t i = 0; i < recalls.size(); ++i) {
+            std::fprintf(stderr, "  [%zu] score=%.4f title=%s | %s\n",
+                         i + 1, recalls[i].score,
+                         recalls[i].title.c_str(), recalls[i].content.c_str());
+        }
+        std::fflush(stderr);
+#endif
         if (!recalls.empty()) {
             current_recall = "[相关记忆]\n";
             int idx = 1;
@@ -237,7 +250,7 @@ std::string ConversationManager::chat(const std::string& user_input,
     // eliminates BPE merge-boundary mismatches and enables INCREMENTAL
     // KV cache reuse across turns.
     std::vector<llama_token> gen_tokens;
-    llm_->chat_stream(messages, stream_cb, cfg_.sampling, &gen_tokens);
+    llm_->chat_stream(messages, stream_cb, cfg_.sampling, &gen_tokens, image_paths);
 
     if (!emotion_parsed) {
         emotion = "neutral";
@@ -254,7 +267,9 @@ std::string ConversationManager::chat(const std::string& user_input,
     // history. gen_tokens holds the exact model-generated token IDs
     // (including trailing EOG) for BPE-stable KV cache reuse.
     int64_t now = winefox::time::now_ms() / 1000;
-    short_term_->append({"user", user_input, "", current_recall, now});
+    memory::Message user_msg{"user", user_input, "", current_recall, now};
+    user_msg.image_paths = image_paths;
+    short_term_->append(user_msg);
     memory::Message asst_msg{"assistant", raw_buffer, emotion, "", now};
     asst_msg.gen_tokens = std::move(gen_tokens);
     short_term_->append(asst_msg);

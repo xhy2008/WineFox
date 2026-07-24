@@ -3,14 +3,24 @@
 // LLM service: wraps llama.cpp to provide LoRA hot-attach/detach, streaming
 // chat generation, and a non-streaming complete() for the distiller.
 //
-// KV cache reuse: chat_stream() compares the new prompt tokens with the
-// previous turn's token sequence. If the new prompt starts with the same
-// prefix, only the suffix is prefilled — the KV cache from prior turns is
-// reused. This requires recall to be injected as separate system messages
-// (not appended to the system prompt), so the system prompt stays stable
-// across turns.
+// KV cache reuse: instead of prefix-matching token IDs, we track two
+// position pointers:
+//   n_cached_tokens_ — number of text tokens already cached (matches
+//                      build_tokens_ output length, excluding image embeddings)
+//   n_cached_kv_     — number of KV positions already cached (includes
+//                      image embedding positions, which have no text token)
+// In the text path, n_cached_tokens_ == n_cached_kv_ (1 token = 1 KV pos).
+// In the vision path, n_cached_kv_ > n_cached_tokens_ (images occupy KV
+// positions without corresponding text tokens).
+//
+// Incremental prefill uses token_start=n_cached_tokens_ (skip count in
+// build_tokens_ output) and pos_start=n_cached_kv_ (KV position to continue
+// from). This works across text/vision alternation because build_tokens_
+// produces identical text token sequences regardless of whether images were
+// present — images only shift KV positions, not text token indices.
 
 #include "../memory/message.h"
+#include "vision_service.h"
 
 #include <chat.h>
 #include <functional>
@@ -76,14 +86,25 @@ public:
     void detach_lora();
     bool lora_attached() const { return lora_attached_; }
 
+    // Load the multimodal projector (mmproj) for vision input. Must be
+    // called after load_base. Returns false if mmproj is invalid or does
+    // not support vision.
+    bool load_vision(const std::string& mmproj_path, const VisionOptions& vopts = {});
+    bool vision_ready() const { return vision_.ready(); }
+
     // Stream a chat completion. `on_token` returns false to stop early.
     // If `out_gen_tokens` is non-null, it receives the model-generated token
     // IDs (including the trailing EOG token) so the caller can store them for
     // BPE-stable KV cache reuse on the next turn.
+    // If `image_paths` is non-empty and vision is loaded, the last user
+    // message's content gets a media marker appended and the prompt suffix
+    // is rendered via mtmd. The text prefix (system + history) is still
+    // built via build_tokens_ for KV cache reuse.
     void chat_stream(const std::vector<memory::Message>& messages,
                      const std::function<bool(const std::string&)>& on_token,
                      const SamplingParams& sp = {},
-                     std::vector<llama_token>* out_gen_tokens = nullptr);
+                     std::vector<llama_token>* out_gen_tokens = nullptr,
+                     const std::vector<std::string>& image_paths = {});
 
     // Non-streaming completion (used by the distiller with LoRA detached).
     bool complete(const std::string& prompt, std::string& out,
@@ -93,15 +114,16 @@ public:
     bool     ready() const { return model_ != nullptr && ctx_ != nullptr; }
     uint32_t n_ctx() const { return ctx_ ? llama_n_ctx(ctx_) : 0; }
 
-    // Mark the KV cache as invalid so the next chat_stream() does a full
+    // Reset the KV cache pointer so the next chat_stream() does a full
     // prefill instead of incremental. Call after reset(), distillation,
     // or any event that changes the prompt prefix.
-    void invalidate_cache() { cache_valid_ = false; }
+    void invalidate_cache() {
+        n_cached_tokens_ = 0;
+        n_cached_kv_     = 0;
+    }
 
     // Pre-warm the KV cache with a static prefix (e.g. system prompt) so
     // the first chat_stream() only needs to prefill the user input suffix.
-    // Builds tokens WITHOUT generation prompt, prefills them, and stores
-    // the token sequence in cached_tokens_ for INCREMENTAL reuse.
     // Returns prefill time in milliseconds, or -1 on failure.
     double warmup_prefill(const std::vector<memory::Message>& messages);
 
@@ -119,24 +141,54 @@ private:
     // Build the full prompt token sequence directly (bypassing the jinja
     // template) so that assistant messages use their stored gen_tokens
     // instead of being re-tokenised. This guarantees that the token sequence
-    // matches cached_tokens_ from the previous turn, enabling INCREMENTAL
-    // KV cache reuse across turns.
+    // is a deterministic extension of the previous turn's cached prefix,
+    // enabling incremental KV cache reuse across turns.
     //
-    // Layout per message:  <|im_start|>{role}\n {content} <|im_end|>\n
+    // Layout per message:  <|im_start|>{role}\n {content} <|im_end|>[\n]
     //   - assistant content comes from m.gen_tokens (excluding trailing EOG)
     //   - other content is tokenised via tokenize_text_
+    //   - assistant footer omits \n (model stops at EOG, no \n in KV cache)
     // Generation prompt (when add_gen_prompt=true):
     //   <|im_start|>assistant\n[<think>\n\n</think>\n\n]
     std::vector<llama_token> build_tokens_(const std::vector<memory::Message>& messages,
                                             bool add_gen_prompt = true);
 
-    // Prefill tokens[start..end) in n_batch-sized chunks. KV cache must be
-    // cleared beforehand if doing a full prefill; for incremental prefill,
-    // leave KV cache intact and llama_batch_get_one auto-sets positions.
-    bool prefill_tokens_(const std::vector<llama_token>& tokens, size_t start);
+    // Split result for vision path: text tokens before/after the image
+    // insertion point. before + after == build_tokens_(messages, true).
+    // The image embeddings are eval'd between before and after.
+    struct TokenSplit {
+        std::vector<llama_token> before;  // tokens up to (not incl.) image marker
+        std::vector<llama_token> after;   // tokens from marker's footer onward
+    };
+
+    // Like build_tokens_, but splits the token sequence at the image marker
+    // position in the last user message. The caller evals image embeddings
+    // between `before` and `after`. This ensures the text token sequence
+    // matches build_tokens_ output exactly (enabling cross-turn reuse even
+    // when images were present in prior turns).
+    TokenSplit build_tokens_split_(const std::vector<memory::Message>& messages,
+                                    int image_user_idx);
+
+    // Prefill tokens[token_start..end) at KV positions [pos_start, pos_start+n).
+    // When logits_last=true, the final token gets logits (needed for sampling).
+    bool prefill_tokens_(const std::vector<llama_token>& tokens,
+                         size_t token_start,
+                         llama_pos pos_start,
+                         bool logits_last = true);
+
     void generate_loop_(const std::function<bool(const std::string&)>& on_token,
                         const SamplingParams& sp,
                         std::vector<llama_token>* generated_tokens);
+
+    // Image-capable chat path: builds the text prefix (system + history) via
+    // build_tokens_ for KV cache reuse, then tokenises the suffix (last user
+    // message with media marker + gen prompt) via mtmd. Evals text prefix +
+    // image chunks + gen prompt, then runs generate_loop_.
+    void chat_stream_with_images_(const std::vector<memory::Message>& messages,
+                                   const std::vector<std::string>& image_paths,
+                                   const std::function<bool(const std::string&)>& on_token,
+                                   const SamplingParams& sp,
+                                   std::vector<llama_token>* out_gen_tokens);
 
     llama_model*         model_  = nullptr;
     llama_context*       ctx_    = nullptr;
@@ -147,14 +199,21 @@ private:
 
     common_chat_templates_ptr chat_templates_;
 
+    VisionService vision_;
+
     // Cached special token IDs (looked up once in load_base).
     llama_token tok_im_start_ = LLAMA_TOKEN_NULL;
     llama_token tok_im_end_   = LLAMA_TOKEN_NULL;  // also the EOG token for Qwen3.5
 
-    // KV cache reuse: full token sequence from the previous chat_stream call
-    // (prefill tokens + generated tokens). Used to find a common prefix.
-    std::vector<llama_token> cached_tokens_;
-    bool                     cache_valid_ = false;
+    // KV cache reuse: two position pointers.
+    // n_cached_tokens_: text tokens already cached (skip count in
+    //   build_tokens_ output). Used as token_start for incremental prefill.
+    // n_cached_kv_: KV positions already cached (includes image embedding
+    //   positions). Used as pos_start for incremental prefill.
+    // In text path: n_cached_tokens_ == n_cached_kv_.
+    // In vision path: n_cached_kv_ = n_cached_tokens_ + total image KV positions.
+    llama_pos n_cached_tokens_ = 0;
+    llama_pos n_cached_kv_     = 0;
 
     LlmOptions opts_;
     PerfData   last_perf_;

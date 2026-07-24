@@ -22,6 +22,7 @@ struct Config {
     // --- LLM backend ---
     struct Llm {
         std::string model_path;
+        std::string mmproj_path;   // multimodal projector (.gguf); empty = vision disabled
         std::string lora_path;
         float       lora_scale    = 1.0f;
         int         n_ctx         = 4096;

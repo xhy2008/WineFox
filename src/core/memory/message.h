@@ -28,6 +28,12 @@ struct Message {
     // cache PARTIAL matches.
     std::vector<int32_t> gen_tokens;
 
+    // user turns only: image file paths attached to this message. Vision
+    // service loads these into bitmaps; build_tokens_ is bypassed and the
+    // prompt is rendered via the jinja template with a media marker so
+    // mtmd_tokenize can splice image embeddings into the token sequence.
+    std::vector<std::string> image_paths;
+
     bool is_user()      const { return role == "user"; }
     bool is_assistant() const { return role == "assistant"; }
     bool is_system()    const { return role == "system"; }
