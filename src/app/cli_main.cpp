@@ -255,10 +255,12 @@ int main(int argc, char** argv) {
         vopts.use_gpu = false;
         vopts.n_threads = cfg.llm.n_threads;
         vopts.flash_attn = cfg.llm.flash_attention_enabled;
-        // Use mmproj defaults (Qwen3VL: min=8, max=4096). mtmd-cli with these
-        // defaults encodes test_red.png in ~142ms, so token count is NOT the
-        // bottleneck. The slow path is in our eval_chunks implementation.
-        vopts.image_min_tokens = -1;
+        // Qwen3VL mmproj defaults produce only ~9 tokens for small images,
+        // but the model warns "require at minimum 1024 image tokens to
+        // function correctly on grounding tasks". Force a higher min for
+        // better visual acuity (color recognition, detail). 64 balances
+        // accuracy and encode latency.
+        vopts.image_min_tokens = 32;
         vopts.image_max_tokens = -1;
         if (llm.load_vision(cfg.llm.mmproj_path, vopts)) {
             std::printf("[OK] 视觉模型: %s\n", cfg.llm.mmproj_path.c_str());
