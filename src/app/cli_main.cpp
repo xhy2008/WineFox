@@ -257,10 +257,15 @@ int main(int argc, char** argv) {
         vopts.flash_attn = cfg.llm.flash_attention_enabled;
         // Qwen3VL mmproj defaults produce only ~9 tokens for small images,
         // but the model warns "require at minimum 1024 image tokens to
-        // function correctly on grounding tasks". Force a higher min for
-        // better visual acuity (color recognition, detail). 64 balances
-        // accuracy and encode latency.
-        vopts.image_min_tokens = 32;
+        // function correctly on grounding tasks". Testing across clean and
+        // context-polluted sessions:
+        //   16 tokens: 0/3 correct (always "gold")
+        //   32 tokens: 3/3 correct in clean sessions, but misidentifies as
+        //             "gold" when prior turns mention 酒狐's gold hair —
+        //             visual signal too weak to override textual priming.
+        //   64 tokens: stable correct identification even with context
+        //             pollution. ~1.7s encode latency is acceptable.
+        vopts.image_min_tokens = 64;
         vopts.image_max_tokens = -1;
         if (llm.load_vision(cfg.llm.mmproj_path, vopts)) {
             std::printf("[OK] 视觉模型: %s\n", cfg.llm.mmproj_path.c_str());

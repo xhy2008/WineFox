@@ -1,11 +1,13 @@
 # Run vision color test N times, deleting DB before each run.
 # Usage: .\run_color_test.ps1 -MinTokens 32 -Runs 3
 param(
-    [int]$Runs = 3
+    [int]$Runs = 3,
+    [string]$InputFile = 'e:\winefox\tests\test_color_input.txt',
+    [string]$Tag = ''
 )
 
 $exe = 'e:\winefox\build\Release\winefox.exe'
-$inputFile = 'e:\winefox\tests\test_color_input.txt'
+$inputFile = $InputFile
 $dbFiles = @('E:\winefox\winefox.db','E:\winefox\winefox.db-wal','E:\winefox\winefox.db-shm')
 
 Set-Location 'e:\winefox'
@@ -24,8 +26,8 @@ for ($i = 1; $i -le $Runs; $i++) {
     $stillThere = Test-Path 'E:\winefox\winefox.db'
     Write-Host "DB exists after delete: $stillThere"
 
-    $logFile = "E:\winefox\tests\test_color_$i.log"
-    $errFile = "E:\winefox\tests\test_color_$i.err"
+    $logFile = "E:\winefox\tests\test_color_$Tag$i.log"
+    $errFile = "E:\winefox\tests\test_color_$Tag$i.err"
     Remove-Item $logFile,$errFile -ErrorAction SilentlyContinue
 
     $outLines = [System.Collections.ArrayList]::new()

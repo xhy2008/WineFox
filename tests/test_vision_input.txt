@@ -1,4 +1,7 @@
 /reset
 /image E:\winefox\tests\test_red.png
-这张图片是什么颜色的？
+这是什么颜色？
+酒狐你怎么了，是生病了吗？
+酒狐你会一直陪着我吗
+酒狐你喜欢什么水果？
 /quit

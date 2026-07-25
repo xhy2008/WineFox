@@ -1,0 +1,12 @@
+﻿...........................
+.....................................................................
+[PERF] LlmService: INCREMENTAL prefill 370 ms (new=145 cached_toks=159 cached_kv=159), 13 tokens in 853 ms (15.2 tok/s)
+[PERF] LlmService: INCREMENTAL prefill 449 ms (new=178 cached_toks=202 cached_kv=202), 23 tokens in 1487 ms (15.5 tok/s)
+[PERF] LlmService: INCREMENTAL prefill 439 ms (new=221 cached_toks=243 cached_kv=243), 21 tokens in 1389 ms (15.1 tok/s)
+[PERF] LlmService: VISION mtmd chunks=3 [TEXT n_tok=1 n_pos=1] [IMAGE n_tok=64 n_pos=8] [TEXT n_tok=1 n_pos=1] mrope=1 marker=<__media__>
+[PERF] LlmService: VISION prefill before=249 after=9 n_cached_toks=243 n_cached_kv=243 image_offset=0 n_past_before_image=249
+[PERF] VisionService: chunk[0] TEXT n_tok=1 55 ms (n_past 249->250)
+[PERF] VisionService: chunk[1] IMAGE n_tok=64 total=2935 ms (encode=1636 ms, n_past 250->258, batch=1)
+[PERF] VisionService: chunk[2] TEXT n_tok=1 52 ms (n_past 258->259)
+[PERF] LlmService: VISION timing: before=159ms image=3042ms after=243ms total=3444ms
+[PERF] LlmService: VISION INCREMENTAL prefill 3444 ms (1 images, before=249 after=9 n_past=268 cached_toks=285 cached_kv=295), 26 tokens in 1727 ms (15.1 tok/s)
