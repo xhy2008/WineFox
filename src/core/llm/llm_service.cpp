@@ -710,9 +710,25 @@ void LlmService::chat_stream(const std::vector<memory::Message>& messages,
     generate_loop_(on_token, sp, &generated);
 
     // --- Update cache pointers for next turn ---
-    // Text path: no images, so n_cached_tokens_ == n_cached_kv_.
+    // n_cached_tokens_: text token count (new_tokens + generated).
+    // n_cached_kv_: actual KV position count. Must be computed from the
+    //   real prefill/generate positions, NOT reset to n_cached_tokens_.
+    //   Prior vision turns leave image embeddings in the KV cache occupying
+    //   positions without text tokens, so n_cached_kv_ >= n_cached_tokens_.
+    //   The difference (image offset) is preserved across text turns:
+    //     new_offset = (K_old + (N - T_old) + G) - (N + G) = K_old - T_old.
+    //   Resetting n_cached_kv_ = n_cached_tokens_ would discard this offset
+    //   and cause the next turn to prefill at a position behind the KV max,
+    //   triggering "X < Y required" M-RoPE position errors.
+    if (can_reuse) {
+        n_cached_kv_ = n_cached_kv_
+                       + static_cast<llama_pos>(new_tokens.size() - n_cached_tokens_)
+                       + static_cast<llama_pos>(generated.size());
+    } else {
+        // Full prefill cleared the KV cache, so the image offset is gone.
+        n_cached_kv_ = static_cast<llama_pos>(new_tokens.size() + generated.size());
+    }
     n_cached_tokens_ = static_cast<llama_pos>(new_tokens.size() + generated.size());
-    n_cached_kv_     = n_cached_tokens_;
 
     if (out_gen_tokens) {
         *out_gen_tokens = std::move(generated);
