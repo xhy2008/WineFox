@@ -2,3 +2,7 @@
 	path = third_party/llama.cpp
 	url = https://github.com/ggml-org/llama.cpp.git
 	branch = master
+[submodule "third_party/sherpa-onnx"]
+	path = third_party/sherpa-onnx
+	url = https://github.com/k2-fsa/sherpa-onnx.git
+	branch = master

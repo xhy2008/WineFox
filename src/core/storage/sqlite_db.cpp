@@ -102,11 +102,7 @@ bool SqliteDb::query(const std::string& sql,
         return false;
     }
     for (size_t i = 0; i < params.size(); ++i) {
-        // Use params[i].size() instead of -1 so that embedded NUL bytes are
-        // preserved. Embeddings are stored as raw float blobs reinterpreted
-        // as std::string, and -1 would truncate at the first '\0'.
-        sqlite3_bind_text(stmt, static_cast<int>(i + 1),
-                          params[i].data(), static_cast<int>(params[i].size()),
+        sqlite3_bind_text(stmt, static_cast<int>(i + 1), params[i].c_str(), -1,
                           SQLITE_TRANSIENT);
     }
     bool ok = true;
@@ -134,8 +130,7 @@ long long SqliteDb::insert(const std::string& sql, const std::vector<std::string
         return -1;
     }
     for (size_t i = 0; i < params.size(); ++i) {
-        sqlite3_bind_text(stmt, static_cast<int>(i + 1),
-                          params[i].data(), static_cast<int>(params[i].size()),
+        sqlite3_bind_text(stmt, static_cast<int>(i + 1), params[i].c_str(), -1,
                           SQLITE_TRANSIENT);
     }
     long long rowid = -1;

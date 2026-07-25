@@ -1,5 +1,6 @@
 # Build output
 /build/
+/build-voice-test/
 
 # IDE caches
 CMakeSettings.json
@@ -16,10 +17,16 @@ CMakeUserPresets.json
 # Third-party sources managed by git submodule or downloaded
 # (submodule gitlinks must be tracked; contents are managed by each submodule's own .gitignore)
 /tts-training/littlemaid_peco/
+# CosyVoice: bundled model weights + python venv (re-download to populate)
+/tts-training/CosyVoice-0.5B/
 
 # Pre-built llama.cpp binaries (kept outside source tree)
 /llama-b10017-bin-win-cpu-x64/
-/llama.cpp-b10017-source/
+/llama-b10017-bin-win-vulkan-x64/
+
+# Pre-built OpenBLAS (CPU BLAS backend for llama.cpp, ~100MB; re-download to populate)
+/third_party/OpenBLAS/
+
 
 # Runtime data
 *.db
@@ -29,9 +36,6 @@ CMakeUserPresets.json
 logs/
 *.log
 *.log.err
-# Test output files
-tests/*.err
-tests/*.out
 winefox.json
 # OS junk
 Thumbs.db
