@@ -24,9 +24,6 @@ CMakeUserPresets.json
 /llama-b10017-bin-win-cpu-x64/
 /llama-b10017-bin-win-vulkan-x64/
 
-# Pre-built OpenBLAS (CPU BLAS backend for llama.cpp, ~100MB; re-download to populate)
-/third_party/OpenBLAS/
-
 
 # Runtime data
 *.db
