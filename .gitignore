@@ -49,6 +49,14 @@ CMakeUserPresets.json
 /voice-test/fbank_lfr_cmvn_feature.json
 /fbank_lfr_cmvn_feature.json
 
+#tts-training data
+/tts-training/cosyvoice_dataset/
+/tts-training/dataset-kokoro-test/
+/tts-training/dataset/
+/tts-training/kokoro-model/
+/tts-training/kokoro-src/
+tts-training/voices-v1.1-zh.bin
+
 # ---------------------------------------------------------------------------
 # Runtime data
 # ---------------------------------------------------------------------------
