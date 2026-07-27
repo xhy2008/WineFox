@@ -67,7 +67,7 @@ def step_setup():
 
     # 1.1 克隆仓库（如不存在）
     if not WINEFOX_DIR.exists():
-        run(f'cd {COLAB_WORK} && git clone https://github.com/your-username/winefox.git')
+        run(f'cd {COLAB_WORK} && git clone https://github.com/xhy2008/winefox.git')
     else:
         print(f'仓库已存在: {WINEFOX_DIR}')
 
