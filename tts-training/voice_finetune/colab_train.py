@@ -64,11 +64,10 @@ def step_setup():
     else:
         print(f'仓库已存在: {WINEFOX_DIR}')
 
-    # 1.2 安装依赖
-    print('\n安装 Python 依赖...')
+    # 1.2 安装依赖（Kokoro 训练用，CosyVoice 依赖由 cosyvoice_setup.py 装）
+    print('\n安装 Python 依赖（Kokoro 训练用）...')
     run('pip install -q kokoro>=0.8 soundfile librosa huggingface_hub')
     run('pip install -q misaki[zh]')
-    run('pip install -q torch torchaudio --index-url https://download.pytorch.org/whl/cu121')
 
     # 1.3 检查 GPU
     print('\n检查 GPU...')
@@ -82,11 +81,11 @@ def step_setup():
     run(f'cd {WINEFOX_DIR} && python tts-training/voice_finetune/setup_kokoro.py')
 
     # 1.5 部署 CosyVoice（用于数据集生成）
-    print('\n部署 CosyVoice2...')
-    run(f'cd {WINEFOX_DIR} && python tts-training/cosyvoice_setup.py --check',
+    # Colab 上无法用 venv（ensurepip 不可用），用 --system-python 直接装到系统 Python
+    print('\n部署 CosyVoice2（--system-python 模式，Colab 兼容）...')
+    run(f'cd {WINEFOX_DIR} && python tts-training/cosyvoice_setup.py --system-python --check',
         check=False)
-    # cosyvoice_setup.py 自身会处理下载与 venv 创建
-    run(f'cd {WINEFOX_DIR} && python tts-training/cosyvoice_setup.py')
+    run(f'cd {WINEFOX_DIR} && python tts-training/cosyvoice_setup.py --system-python')
 
     print('\n✓ 环境准备完成')
 
@@ -97,14 +96,9 @@ def step_dataset(batch=1000):
     print(f'Step 2: 生成数据集 (batch={batch})')
     print('=' * 60)
 
-    # 用 CosyVoice venv 运行生成脚本
-    cosyvoice_venv_python = TTS_TRAINING / 'CosyVoice-0.5B' / 'venv' / 'bin' / 'python'
-    if not cosyvoice_venv_python.exists():
-        # Colab 上 venv 路径可能不同，尝试用系统 python + 已安装的 cosyvoice
-        cosyvoice_venv_python = 'python'
-
-    run(f'cd {WINEFOX_DIR} && {cosyvoice_venv_python} '
-        f'tts-training/cosyvoice_dataset/generate.py '
+    # Colab 上用 --system-python 模式，直接用系统 python 运行生成脚本
+    # 依赖已由 cosyvoice_setup.py --system-python 装到系统 Python
+    run(f'cd {WINEFOX_DIR} && python tts-training/cosyvoice_dataset/generate.py '
         f'--colab --batch {batch}')
 
     # 检查生成结果
