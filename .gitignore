@@ -42,13 +42,6 @@ CMakeUserPresets.json
 # Test data: audio files, numpy dumps, ASR/VAD output texts
 /voice-test/test-data/
 
-# Archived ggml binaries (source code under _archive_ggml IS tracked)
-/voice-test/_archive_ggml/models/
-/voice-test/_archive_ggml/test-data/
-
-# Upstream Kokoro Python repo clone (re-clone via scripts/download_kokoro.py)
-/voice-test/third_party/kokoro-src/
-
 # Pre-built ONNX Runtime binary (re-download via CMake fetch)
 /voice-test/third_party/onnxruntime-prebuilt/
 

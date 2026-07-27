@@ -75,13 +75,13 @@ TTS 首音块:         150-400 ms
 | ONNX split INT8-static decoder (Python ORT, t=8) | 0.73 | 1.32x 实时 |
 | **ONNX split INT8-static decoder (C++ ORT, t=8)** | **0.67** | **正式采用**，1.50x 实时 |
 
-**ggml 路径瓶颈**（详见 `voice-test/_archive_ggml/README.md`）：
+**ggml 路径瓶颈**（ggml 代码已删除，此处保留历史分析）：
 1. `ggml_compute_forward_repeat_f32` 对 `ne[0]=1` 的 tensor 逐元素循环，无法并行。
 2. 2171 个计算节点 × per-node barrier 同步，调度开销大。
 3. ggml 的 im2col 仅在特定 shape 下生效，iSTFTNet 的 stride/kernel 组合未命中优化路径。
 4. instance_norm / snake / adain_resblock 等组合算子无 fused 实现，每次拆解引入额外中间 tensor 和 barrier。
 
-**结论**：ggml 不是为卷积优化的，iSTFTNet 这种 conv-heavy decoder 在 ggml 上无法发挥优势。继续优化 ggml 路径投入产出比低，决定归档相关代码（`voice-test/_archive_ggml/`），专注 ONNX Runtime 优化。
+**结论**：ggml 不是为卷积优化的，iSTFTNet 这种 conv-heavy decoder 在 ggml 上无法发挥优势。继续优化 ggml 路径投入产出比低，已删除 ggml 相关代码，专注 ONNX Runtime 优化。
 
 **ONNX Runtime 优化路线**：
 - [x] split 模式（encoder FP32 + decoder INT8-static），C++ 实测 1.50x 实时
@@ -467,7 +467,7 @@ public:
 
 **实现要点**：
 - **模型**：Kokoro-82M（中文，酒狐音色待 Phase 5 蒸馏替换），split 模式（encoder FP32 + decoder INT8-static）。
-- **推理后端**：ONNX Runtime（详见 [0.5.1 节](#L67)）。ggml 路径已废弃并归档到 `voice-test/_archive_ggml/`。
+- **推理后端**：ONNX Runtime（详见 [0.5.1 节](#L67)）。ggml 路径已废弃并删除。
 - **split 模式架构**：
   - encoder ONNX：PLBERT + text encoder + duration/F0/N predictors（FP32，4 线程）
   - decoder ONNX：iSTFTNet（INT8-static 量化，8 线程，conv-heavy 并行好）

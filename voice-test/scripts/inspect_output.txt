@@ -1,5 +1,0 @@
-﻿Loading e:\winefox\voice-test\models\kokoro-v1.1-zh.onnx ...
-
-=== IR version: 8, opset: [17]
-=== Producer: pytorch 2.6.0
-=== Nodes: 4742, Inputs: 3, Outputs: 2

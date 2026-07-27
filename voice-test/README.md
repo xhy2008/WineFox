@@ -138,9 +138,6 @@ test-data/
 └── results/                      # outputs from benchmark runs
 ```
 
-An older set of test files from the previous (sherpa-onnx-based) voice-test
-is preserved under `_archive_v1/` for cross-validation.
-
 ---
 
 ## Phase 1: VAD benchmark summary

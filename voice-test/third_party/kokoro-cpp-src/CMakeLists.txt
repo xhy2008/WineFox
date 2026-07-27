@@ -144,6 +144,10 @@ include_directories(${CMAKE_SOURCE_DIR}/third_party/cppjieba/include)
 include_directories(${CMAKE_SOURCE_DIR}/third_party/cppjieba/deps/limonp/include)
 
 # Shared Sources
+# NOTE: missing_symbols.cpp is intentionally excluded — it provides
+# __std_find_first_of_trivial_pos_{1,2} which are already present in
+# libcpmt.lib when building with /MT (static runtime), so including it
+# causes LNK2005 duplicate symbol errors.
 set(LIB_SOURCES
     Kokoro.cpp
     Tokenizer.cpp
@@ -151,68 +155,16 @@ set(LIB_SOURCES
     PinyinFinder.cpp
     ToneSandhi.cpp
     ZHFrontend.cpp
-    missing_symbols.cpp
 )
 
 add_library(kokoro_core STATIC ${LIB_SOURCES})
 
-# 所有编译选项已在全局设置中配置
-
-# Demo Executables
-add_executable(zhg2p_demo main.cpp)
-target_link_libraries(zhg2p_demo kokoro_core)
-
-# 为zhg2p_demo添加链接器选项
-if (MSVC)
-    target_link_options(zhg2p_demo PRIVATE "/IGNORE:4099" "/FORCE:MULTIPLE")
-    
-    # 添加必要的Windows系统库
-    target_link_libraries(zhg2p_demo "Advapi32.lib")
-    target_link_libraries(zhg2p_demo "Ws2_32.lib")
-    target_link_libraries(zhg2p_demo "Shlwapi.lib")
-    target_link_libraries(zhg2p_demo "userenv.lib")
-    
-    # 添加标准库支持
-    target_link_libraries(zhg2p_demo "Synchronization.lib")
-    
-    # 添加安全检查支持
-    target_link_libraries(zhg2p_demo "bufferoverflowu.lib")
-endif()
-
-add_executable(kokoro_demo kokoro_main.cpp)
-target_link_libraries(kokoro_demo kokoro_core)
-
+# Link ONNX Runtime to the core library (needed by Kokoro.cpp).
 if (ONNXRUNTIME_LIB)
-    target_link_libraries(kokoro_demo ${ONNXRUNTIME_LIB})
-    
-    # 添加额外的系统库
-    if (APPLE)
-        target_link_libraries(kokoro_demo "-framework Foundation" "-framework CoreFoundation")
-    endif()
-    
-    # Windows特殊处理
+    target_link_libraries(kokoro_core ${ONNXRUNTIME_LIB})
     if (MSVC)
-        # 添加必要的Windows系统库
-        target_link_libraries(kokoro_demo "Advapi32.lib")
-        target_link_libraries(kokoro_demo "Ws2_32.lib")
-        target_link_libraries(kokoro_demo "Shlwapi.lib")
-        target_link_libraries(kokoro_demo "userenv.lib")
-        
-        # 添加标准库支持
-        target_link_libraries(kokoro_demo "Synchronization.lib")
-        
-        # 添加安全检查支持
-        target_link_libraries(kokoro_demo "bufferoverflowu.lib")
-        
-        # 添加链接器选项
-        target_link_options(kokoro_demo PRIVATE "/IGNORE:4099" "/FORCE:MULTIPLE")
-    endif()
-    
-    # Add rpath to find the dylib at runtime
-    if (APPLE)
-        set_target_properties(kokoro_demo PROPERTIES INSTALL_RPATH "@loader_path/../third_party/onnxruntime/lib/mac_arm64")
-    elseif (UNIX)
-        set_target_properties(kokoro_demo PROPERTIES INSTALL_RPATH "$ORIGIN/../third_party/onnxruntime/lib/linux_x64")
+        target_link_libraries(kokoro_core
+            Advapi32 Ws2_32 Shlwapi userenv Synchronization)
     endif()
 endif()
 

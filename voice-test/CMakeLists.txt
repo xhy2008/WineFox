@@ -52,8 +52,8 @@ option(VOICE_TEST_ENABLE_TTS  "Enable Kokoro TTS benchmark"                OFF)
 option(VOICE_TEST_ENABLE_STREAM "Enable full streaming VAD+ASR benchmark" OFF)
 
 # NOTE: VOICE_TEST_ENABLE_TTS_GGML has been removed. The ggml-based Kokoro
-# decoder was archived to _archive_ggml/ on 2026-07-27 because ggml is not
-# optimized for the conv-heavy iSTFTNet decoder (RTF=3.07 vs ONNX RTF=0.73).
+# decoder was deleted on 2026-07-27 because ggml is not optimized for the
+# conv-heavy iSTFTNet decoder (RTF=3.07 vs ONNX RTF=0.73).
 # Use VOICE_TEST_ENABLE_TTS (ONNX Runtime split mode) instead.
 
 # ---------------------------------------------------------------------------
@@ -193,10 +193,6 @@ if(VOICE_TEST_ENABLE_TTS)
     endif()
 
     # Kokoro G2P + engine sources (compiled directly into voice_test).
-    # NOTE: missing_symbols.cpp is intentionally excluded — it provides
-    # __std_find_first_of_trivial_pos_{1,2} which are already present in
-    # libcpmt.lib when building with /MT (static runtime), so including it
-    # causes LNK2005 duplicate symbol errors.
     target_sources(voice_test PRIVATE
         src/tts_test.cpp
         ${KOKORO_SRC_ROOT}/Kokoro.cpp
