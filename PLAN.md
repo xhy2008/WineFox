@@ -493,7 +493,7 @@ system:[system_prompt]
 
 user:酒狐，你还记得那天.........
 
-system:[相关记忆1]
+tool:[相关记忆1]
 
 assistant:当然了，那天我.......
 
@@ -503,19 +503,19 @@ system:[system_prompt]
 
 user:酒狐，你还记得那天.........			(KV Cache可复用)
 
-system:[相关记忆1]					(KV Cache可复用)
+tool:[相关记忆1]					(KV Cache可复用)
 
 assistant:当然了，那天我.......			(KV Cache可复用)
 
 user:那你应该没忘了我那天答应你要........
 
-system:[相关记忆2]
+tool:[相关记忆2]
 
 assistant:怎么可能，我都记得清楚呢，..........
 
 用户第N次输入时，超出上下文限制，去除最前面的几轮对话（保留system_prompt)，保证留有30%上下文空间用于下一轮对话。
 
-**关键设计**：recall 不再附加到 system prompt 中，而是作为独立 system 消息插入在每轮 user 消息之后。这样 system prompt 保持静态（仅人设 + 档案），所有 recall 和对话历史都成为连续 token 序列的一部分，下一轮 prompt 的前缀与上一轮完全对齐，KV cache 可以前缀复用。
+**关键设计**：recall 不再附加到 system prompt 中，而是作为独立 tool 消息插入在每轮 user 消息之后。这样 system prompt 保持静态（仅人设 + 档案），所有 recall 和对话历史都成为连续 token 序列的一部分，下一轮 prompt 的前缀与上一轮完全对齐，KV cache 可以前缀复用。
 
 **Qwen3.5 ChatML 多 system 消息支持**：ChatML 模板是一个简单的 for 循环（`{% for message in messages %}{{'<|im_start|>' + message['role']}}`），支持任意数量、任意顺序的 system/user/assistant 消息。`common_chat_templates_apply` 正确处理多 system 消息的渲染。
 

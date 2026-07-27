@@ -21,3 +21,54 @@
 | 模型训练（探索中）     | lora微调LLM固定酒狐人设信息，TTS模型微调音色匹配酒狐         |
 | 性能优化（跟进中）     | 每个模块在我如同土豆的电脑上经过严格的性能测试，ASR和TTS确保RTF<1，LLM首字延迟<1s |
 
+# 技术细节
+
+## 记忆
+
+研究多个记忆框架之后发现开源领域没有让我满意的方案，决定自己综合多个框架写一个。
+
+ASR->输入文本->Embedding模型->SQLite匹配相似度->LLM->TTS
+
+模型上下文使用:
+
+system:{.............................}
+
+user:{...........................}
+
+tool:{[相关记忆]..................[当前时间]..........[状态]......}
+
+assistant:{..........................}
+
+下一轮对话时，仅对输入和记忆召回部分进行prefill，前文KV Cache完全复用，把首字延迟降低到1s以内。
+
+
+
+## 语音
+
+### ASR
+
+使用项目:https://github.com/lovemefan/SenseVoice.cpp
+
+量化到q4_0的模型，ggml推理，RTF<1，实时流式识别，准确率达标
+
+### VAD
+
+使用项目:https://github.com/TEN-framework/ten-vad
+
+原版TEN-VAD使用ONNX推理，无需特殊优化。
+
+后期为了增强与ASR的协作能力可能会考虑参考https://github.com/danielbodart/ten-vad-ggml移植到ggml后端
+
+### TTS
+
+参考项目:https://github.com/koth/kokoro.cpp
+
+原版ONNX推理kokoro（支持中英文混合合成还能保证音质的最小TTS模型）的RTF>3，不能实时。
+
+通过分离Encoder和Decoder分块并行推理和INT8量化把RTF降低到0.67，内存占用降到400MB左右。
+
+构建Chunk-based管道，争取把LLM输出到TTS输出的延迟压缩到500ms左右。
+
+#### 其他细节请参考PLAN.md和TODO.md
+
+本项目完全由Trae Work+GLM5.2生成，我只进行模型的微调工作。
