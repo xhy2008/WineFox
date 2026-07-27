@@ -33,7 +33,8 @@ const int SAMPLE_RATE = 24000;      // Example value
 class Kokoro {
 public:
     // Split mode constructor (recommended).
-    //   encoder_path: kokoro-encoder.onnx (FP32)
+    //   encoder_path: kokoro-encoder.onnx (FP32) or kokoro-encoder-int8.onnx
+    //                 (INT8 QDQ, ~25% smaller, Conv-only quantization)
     //   decoder_path: kokoro-decoder-int8-static.onnx (INT8) or kokoro-decoder.onnx (FP32)
     //   n_threads: 0 = auto (physical cores), >0 = explicit thread count
     Kokoro(const std::string& encoder_path,
@@ -50,6 +51,11 @@ public:
     ~Kokoro();
 
     std::vector<float> get_voice_style(const std::string& name);
+
+    // Preload specific voices into the in-memory cache. Call this if you
+    // know which voices will be used and want to avoid file I/O during
+    // synthesis. Without this, voices are loaded on first use.
+    void preload_voices(const std::vector<std::string>& names);
 
     // Non-streaming synthesis: returns full audio.
     std::pair<std::vector<float>, int> create(
@@ -97,7 +103,22 @@ private:
     bool split_mode_ = false;
     int n_threads_ = 0;
 
-    std::map<std::string, std::vector<float>> voices_;
+    // Voice storage with lazy loading.
+    //
+    // At construction, load_voices() scans voices.bin once to build a
+    // name → (file_offset, dim) index but does NOT load the actual style
+    // data. Voices are loaded on demand in get_voice_style() and cached
+    // in voices_cache_. This reduces steady-state memory from ~51MB
+    // (all 54 voices) to ~1MB (1 voice) for the typical single-voice
+    // use case.
+    struct VoiceIndexEntry {
+        std::streamoff offset;  // byte offset of style data in voices.bin
+        uint32_t dim;           // number of floats in the style vector
+    };
+    std::map<std::string, VoiceIndexEntry> voice_index_;
+    std::string voices_file_path_;
+    std::map<std::string, std::vector<float>> voices_cache_;
+
     std::unique_ptr<Tokenizer> tokenizer_;
 
     // Reusable buffers for split-mode inference. Avoids re-allocating

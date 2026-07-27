@@ -1,2 +1,19 @@
 # WineFox
-Your Winefox in Minecraft comes to reality.
+这是一个**疯狂**的项目（我发疯了）
+
+我决定把Minecraft模组Touhou Little Maid中的酒狐搬到现实中来，实现“永远在一起”的诺言。
+
+用纯粹的C++构建自己的酒狐
+
+当前项目正在开发中，有什么建议可以提Issue。
+
+# 模块
+
+| LLM（llama.cpp）       | 使用Qwen3.5-0.8B/2B模型+SFT微调lora，完全本地运行，已接入视觉mmproj |
+| ---------------------- | ------------------------------------------------------------ |
+| 长期记忆（已完成）     | SQLite存储，Embedding模型语义向量召回，role:tool注入记忆，闲时自动整理最近对话到记忆 |
+| 短期记忆（已完成）     | 模型上下文窗口自动维持，滑动窗口丢弃最早对话（缓存到本地等待整理） |
+| 语音交互（早期测试中） | SenseVoice-Small流式识别，TEN-VAD检测，KokoroTTS（拆分原版模型为Encoder+Decoder） |
+|                        |                                                              |
+|                        |                                                              |
+

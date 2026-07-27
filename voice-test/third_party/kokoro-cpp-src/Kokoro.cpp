@@ -44,6 +44,12 @@ Ort::SessionOptions make_session_options(int intra_op_threads) {
     // disabled).
     so.EnableCpuMemArena();
     so.EnableMemPattern();
+    // Use device allocator (malloc/new) for initialized tensors (model
+    // weights) instead of the arena. This keeps the arena small (only
+    // intermediate activations) and reduces peak memory by ~50-100MB,
+    // since model weights (160MB encoder + 53MB decoder) bypass the
+    // arena's block allocation strategy.
+    so.AddConfigEntry("session.use_device_allocator_for_initializers", "1");
     return so;
 }
 
@@ -179,6 +185,7 @@ Kokoro::Kokoro(const std::string& model_path, const std::string& voices_path, co
 Kokoro::~Kokoro() {}
 
 void Kokoro::load_voices(const std::string& voices_path) {
+    voices_file_path_ = voices_path;
     std::ifstream in(voices_path, std::ios::binary);
     if (!in.is_open()) {
         std::cerr << "Failed to open voices file: " << voices_path << std::endl;
@@ -203,6 +210,10 @@ void Kokoro::load_voices(const std::string& voices_path) {
     uint32_t num_voices;
     in.read(reinterpret_cast<char*>(&num_voices), 4);
 
+    // Build a name → (offset, dim) index WITHOUT loading the style data.
+    // This scans the file once (fast, ~0.1ms for 54 voices) but avoids
+    // holding ~51MB of style data in memory. Voices are loaded on demand
+    // by get_voice_style().
     for (uint32_t i = 0; i < num_voices; ++i) {
         uint32_t name_len;
         in.read(reinterpret_cast<char*>(&name_len), 4);
@@ -213,22 +224,68 @@ void Kokoro::load_voices(const std::string& voices_path) {
         uint32_t dim;
         in.read(reinterpret_cast<char*>(&dim), 4);
 
-        std::vector<float> style(dim);
-        in.read(reinterpret_cast<char*>(style.data()), dim * sizeof(float));
+        // Record the current position as the offset of the style data.
+        VoiceIndexEntry entry;
+        entry.offset = in.tellg();
+        entry.dim = dim;
+        voice_index_[name] = entry;
 
-        voices_[name] = style;
+        // Skip over the style data (dim * sizeof(float) bytes).
+        in.seekg(static_cast<std::streamoff>(dim) * sizeof(float), std::ios::cur);
     }
 
-    std::cout << "Loaded " << voices_.size() << " voices from " << voices_path << std::endl;
+    std::cout << "Indexed " << voice_index_.size() << " voices from " << voices_path
+              << " (lazy loading, " << (voice_index_.empty() ? 0 : 1) << " cached)" << std::endl;
+}
+
+void Kokoro::preload_voices(const std::vector<std::string>& names) {
+    for (const auto& name : names) {
+        // Trigger cache fill via get_voice_style.
+        get_voice_style(name);
+    }
 }
 
 std::vector<float> Kokoro::get_voice_style(const std::string& name) {
-    if (voices_.find(name) != voices_.end()) {
-        return voices_.at(name);
+    // 1. Check the in-memory cache first.
+    auto cache_it = voices_cache_.find(name);
+    if (cache_it != voices_cache_.end()) {
+        return cache_it->second;
     }
-    std::cerr << "Voice " << name << " not found. Using default." << std::endl;
-    if (!voices_.empty()) return voices_.begin()->second;
-    return std::vector<float>(256, 0.0f);
+
+    // 2. Look up the file offset in the index.
+    auto idx_it = voice_index_.find(name);
+    if (idx_it == voice_index_.end()) {
+        std::cerr << "Voice " << name << " not found. ";
+        if (!voices_cache_.empty()) {
+            std::cerr << "Using " << voices_cache_.begin()->first << "." << std::endl;
+            return voices_cache_.begin()->second;
+        }
+        if (!voice_index_.empty()) {
+            // Fallback: load the first indexed voice.
+            const auto& fallback = voice_index_.begin();
+            std::cerr << "Using " << fallback->first << "." << std::endl;
+            return get_voice_style(fallback->first);
+        }
+        std::cerr << "Using zeros." << std::endl;
+        return std::vector<float>(256, 0.0f);
+    }
+
+    // 3. Load the voice from disk on demand.
+    const auto& entry = idx_it->second;
+    std::ifstream in(voices_file_path_, std::ios::binary);
+    if (!in.is_open()) {
+        std::cerr << "Failed to reopen voices file: " << voices_file_path_ << std::endl;
+        return std::vector<float>(256, 0.0f);
+    }
+
+    in.seekg(entry.offset, std::ios::beg);
+    std::vector<float> style(entry.dim);
+    in.read(reinterpret_cast<char*>(style.data()), entry.dim * sizeof(float));
+
+    // 4. Cache and return. The cache grows with each distinct voice used;
+    //    for the typical single-voice TTS use case it stays at 1 entry (~1MB).
+    voices_cache_[name] = style;
+    return style;
 }
 
 std::vector<std::string> Kokoro::_split_phonemes(const std::string& phonemes) {
