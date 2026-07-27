@@ -56,7 +56,8 @@ CMakeUserPresets.json
 /tts-training/kokoro-model/
 /tts-training/kokoro-src/
 tts-training/voices-v1.1-zh.bin
-
+/tts-training/voice_finetune/verify_output/
+/tts-training/voice_finetune/output/
 # ---------------------------------------------------------------------------
 # Runtime data
 # ---------------------------------------------------------------------------
