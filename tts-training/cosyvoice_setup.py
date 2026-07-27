@@ -304,17 +304,52 @@ def install_deps(venv_python, use_system_python=False):
 
 
 def download_model(venv_python):
-    """通过 ModelScope 下载 CosyVoice2-0.5B 模型权重（~2GB）。"""
+    """通过 ModelScope 下载 CosyVoice2-0.5B 模型权重（~2GB）。
+
+    Colab Jupyter 环境下 tqdm 进度条会逐行刷新导致页面卡死，
+    因此禁用 modelscope 的进度条，改为静默下载 + 阶段性 print。
+    """
     if MODEL_DIR.exists() and any(MODEL_DIR.iterdir()):
         print(f'[skip] 模型已存在: {MODEL_DIR}')
         return
     step(f'下载模型 {MODELSCOPE_ID}（~2GB，从 ModelScope）')
     MODEL_DIR.parent.mkdir(parents=True, exist_ok=True)
-    # modelscope 已在 requirements.txt 中，直接调用
+
+    # 用独立脚本下载，禁用所有进度条输出
+    # modelscope 的 snapshot_download 内部用 tqdm，在 Colab Jupyter 里逐文件刷新
+    # 会导致页面卡死。通过 patch tqdm 为空操作彻底禁用。
+    model_dir_str = str(MODEL_DIR).replace('\\', '/')
     script = (
-        f"from modelscope import snapshot_download\n"
-        f"snapshot_download('{MODELSCOPE_ID}', local_dir=r'{MODEL_DIR}')\n"
-        f"print('模型下载完成:', r'{MODEL_DIR}')\n"
+        "import os, sys\n"
+        "os.environ['TQDM_DISABLE'] = '1'\n"
+        "os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'\n"
+        "\n"
+        "# Patch tqdm 为空操作，彻底禁用进度条刷屏\n"
+        "import tqdm\n"
+        "class _NoProgress:\n"
+        "    def __init__(self, *a, **k): pass\n"
+        "    def update(self, *a, **k): pass\n"
+        "    def close(self): pass\n"
+        "    def __enter__(self): return self\n"
+        "    def __exit__(self, *a): pass\n"
+        "    def write(self, s, **k): pass\n"
+        "tqdm.tqdm = _NoProgress\n"
+        "try:\n"
+        "    import tqdm.auto as _ta; _ta.tqdm = _NoProgress\n"
+        "except Exception: pass\n"
+        "\n"
+        "print('开始下载（进度条已禁用，请耐心等待）...', flush=True)\n"
+        "from modelscope import snapshot_download\n"
+        f"path = snapshot_download('{MODELSCOPE_ID}', local_dir='{model_dir_str}')\n"
+        f"print('模型下载完成:', path, flush=True)\n"
+        "\n"
+        "# 列出下载的文件\n"
+        f"for root, dirs, files in os.walk('{model_dir_str}'):\n"
+        "    for f in files:\n"
+        "        fp = os.path.join(root, f)\n"
+        "        size_mb = os.path.getsize(fp) / 1024 / 1024\n"
+        f"        rel = os.path.relpath(fp, '{model_dir_str}')\n"
+        "        print(f'  {rel} ({size_mb:.1f} MB)')\n"
     )
     run([str(venv_python), '-c', script], cwd=REPO_DIR)
 

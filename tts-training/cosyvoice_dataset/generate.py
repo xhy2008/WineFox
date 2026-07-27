@@ -74,6 +74,26 @@ def load_prompt_text(ref_path):
 
 def init_model(model_dir):
     """加载 CosyVoice2 模型。"""
+    # 禁用 tqdm 进度条，避免 Colab Jupyter 刷屏卡死
+    import os
+    os.environ['TQDM_DISABLE'] = '1'
+    os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'
+    try:
+        import tqdm
+        class _NoProgress:
+            def __init__(self, *a, **k): pass
+            def update(self, *a, **k): pass
+            def close(self): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def write(self, s, **k): pass
+        tqdm.tqdm = _NoProgress
+        try:
+            import tqdm.auto as _ta; _ta.tqdm = _NoProgress
+        except Exception: pass
+    except ImportError:
+        pass
+
     sys.path.insert(0, str(REPO_DIR))
     sys.path.insert(0, str(REPO_DIR / 'third_party' / 'Matcha-TTS'))
     from cosyvoice.cli.cosyvoice import AutoModel
