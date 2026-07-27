@@ -2,7 +2,6 @@
 	path = third_party/llama.cpp
 	url = https://github.com/ggml-org/llama.cpp.git
 	branch = master
-[submodule "third_party/sherpa-onnx"]
-	path = third_party/sherpa-onnx
-	url = https://github.com/k2-fsa/sherpa-onnx.git
-	branch = master
+[submodule "voice-test/third_party/sensevoice-cpp"]
+	path = voice-test/third_party/sensevoice-cpp
+	url = https://github.com/lovemefan/SenseVoice.cpp.git

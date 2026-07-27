@@ -1,16 +1,16 @@
-// voice_test: standalone sherpa-onnx integration sandbox.
+// voice-test/src/main.cpp
+//
+// Entry point. Dispatches to subcommands based on argv[1].
 //
 // Usage:
-//   voice_test smoke                       # version + link check (no models)
-//   voice_test asr  <wav> [--asr-model P] [--asr-tokens P] [--language auto|zh|en|ja|ko|yue]
-//   voice_test vad  <wav> [--vad-model P] [--threshold 0.5] [--window 256]
-//   voice_test tts  <text> <out.wav> [--tts-model P] [--tts-tokens P] [--tts-lexicon P]
-//   voice_test help
+//   voice_test smoke
+//   voice_test vad  <wav> [--threshold 0.5] [--hop 256]
+//   voice_test asr  <wav> [--model <gguf>] [--lang auto|zh|en|...]
+//   voice_test tts  <text> --model <onnx> --voices <bin> [--out <wav>]
+//   voice_test stream <wav> [--realtime|--no-realtime]
 //
-// Default model paths assume the binary is launched from the winefox repo
-// root (see common.h). Override per-invocation with the flags above.
-
-#include "common.h"
+// Subcommands vad/asr/tts/stream are only available when the
+// corresponding VOICE_TEST_HAS_* macro is defined at build time.
 
 #include <cstdio>
 #include <cstdlib>
@@ -18,102 +18,172 @@
 #include <string>
 #include <vector>
 
-#ifdef _WIN32
-#  include <windows.h>
-#endif
+#include "common.h"
 
-using namespace voice_test;
+// ---------------------------------------------------------------------------
+// Windows: get UTF-8 argv from the wide-character command line.
+//
+// On Chinese Windows the default system code page is GBK, so argv[] from
+// main() contains GBK-encoded strings. Jieba/PinyinFinder dictionaries
+// are UTF-8, so any non-ASCII input (Chinese text, paths with CJK chars)
+// would fail to match. We use GetCommandLineW + CommandLineToArgvW to
+// get proper Unicode argv, then convert to UTF-8 for the rest of the
+// program.
+// ---------------------------------------------------------------------------
+#if defined(_WIN32)
+#  define WIN32_LEAN_AND_MEAN
+#  define NOMINMAX
+#  include <windows.h>
+#  include <shellapi.h>
+
+// CommandLineToArgvW is in shell32.lib; link it here for convenience.
+#  pragma comment(lib, "shell32.lib")
+
+static std::vector<std::string> wargv_to_utf8(int argc, wchar_t** wargv) {
+    std::vector<std::string> out;
+    out.reserve(argc);
+    for (int i = 0; i < argc; ++i) {
+        int len = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1,
+                                      nullptr, 0, nullptr, nullptr);
+        std::string s(len > 0 ? len - 1 : 0, '\0');
+        if (len > 1) {
+            WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1,
+                                &s[0], len, nullptr, nullptr);
+        }
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+#endif  // _WIN32
+
+// Helper macros that evaluate to 1/0 regardless of whether the
+// corresponding VOICE_TEST_HAS_* is defined. Used by print_usage().
+#if defined(VOICE_TEST_HAS_VAD)
+#  define VOICE_TEST_HAS_VAD_DEFINED 1
+#else
+#  define VOICE_TEST_HAS_VAD_DEFINED 0
+#endif
+#if defined(VOICE_TEST_HAS_ASR)
+#  define VOICE_TEST_HAS_ASR_DEFINED 1
+#else
+#  define VOICE_TEST_HAS_ASR_DEFINED 0
+#endif
+#if defined(VOICE_TEST_HAS_TTS)
+#  define VOICE_TEST_HAS_TTS_DEFINED 1
+#else
+#  define VOICE_TEST_HAS_TTS_DEFINED 0
+#endif
+#if defined(VOICE_TEST_HAS_STREAM)
+#  define VOICE_TEST_HAS_STREAM_DEFINED 1
+#else
+#  define VOICE_TEST_HAS_STREAM_DEFINED 0
+#endif
 
 static void print_usage() {
     std::printf(
-        "voice_test — sherpa-onnx integration sandbox\n"
+        "voice_test - voice front-end benchmark sandbox\n"
         "\n"
-        "USAGE:\n"
-        "  voice_test smoke                 Print sherpa-onnx version (no models)\n"
-        "  voice_test asr <wav> [opts]      Transcribe a 16kHz mono WAV\n"
-        "  voice_test vad <wav> [opts]      Detect speech segments in a WAV\n"
-        "  voice_test tts <text> <out.wav>  (placeholder, no model yet)\n"
-        "  voice_test help                  Show this message\n"
-        "\n"
-        "ASR options:\n"
-        "  --asr-model <path>     SenseVoice ONNX model (default: models/asr/sense-voice-small-int8.onnx)\n"
-        "  --asr-tokens <path>    tokens.txt (default: models/asr/tokens.txt)\n"
-        "  --language <lang>      auto|zh|en|ja|ko|yue (default: auto)\n"
-        "  --no-itn               Disable inverse text normalization\n"
-        "\n"
-        "VAD options:\n"
-        "  --vad-model <path>     TEN-VAD ONNX model (default: models/vad/ten-vad.onnx)\n"
-        "  --threshold <f>        Speech probability threshold (default 0.5)\n"
-        "  --window <n>           Frame size in samples (default 256)\n"
-        "  --min-silence <f>      Min silence duration in seconds (default 0.3)\n"
-        "  --min-speech <f>       Min speech duration in seconds (default 0.25)\n"
-        "\n"
-        "TTS options (Phase 5, placeholder):\n"
-        "  --tts-model <path>     VITS/kokoro ONNX model\n"
-        "  --tts-tokens <path>    tokens.txt\n"
-        "  --tts-lexicon <path>   lexicon.txt\n");
-}
-
-// Apply global --asr-model / --asr-tokens / --vad-model / --tts-* flags to the
-// ModelPaths struct. Returns the remaining positional args.
-static std::vector<std::string> apply_model_overrides(
-        const std::vector<std::string>& args, ModelPaths& mp) {
-    std::vector<std::string> positional;
-    for (size_t i = 0; i < args.size(); ++i) {
-        const std::string& a = args[i];
-        auto next = [&]() -> const std::string& {
-            if (i + 1 >= args.size()) {
-                std::fprintf(stderr, "error: %s expects a value\n", a.c_str());
-                std::exit(2);
-            }
-            return args[++i];
-        };
-        if      (a == "--asr-model")   mp.asr_model  = next();
-        else if (a == "--asr-tokens")  mp.asr_tokens = next();
-        else if (a == "--vad-model")   mp.vad_model  = next();
-        else if (a == "--tts-model")   mp.tts_model  = next();
-        else if (a == "--tts-tokens")  mp.tts_tokens = next();
-        else if (a == "--tts-lexicon") mp.tts_lexicon = next();
-        else positional.push_back(a);
-    }
-    return positional;
+        "Usage:\n"
+        "  voice_test smoke\n"
+        "      Run a quick self-check; verifies WAV I/O and prints build info.\n"
+        "\n");
+#if defined(VOICE_TEST_HAS_VAD)
+    std::printf(
+        "  voice_test vad <wav> [--threshold 0.5] [--hop 256]\n"
+        "      Run ten-vad on <wav>, report detected speech segments and latency.\n"
+        "\n");
+#endif
+#if defined(VOICE_TEST_HAS_ASR)
+    std::printf(
+        "  voice_test asr <wav> [--model <gguf>] [--lang auto]\n"
+        "      Run SenseVoice.cpp on <wav>, report transcript and RTF.\n"
+        "\n");
+#endif
+#if defined(VOICE_TEST_HAS_TTS)
+    std::printf(
+        "  voice_test tts <text> --model <onnx> --voices <bin> [--out <wav>]\n"
+        "      Run Kokoro TTS on <text>, write synthesized audio to <wav>.\n"
+        "\n");
+#endif
+#if defined(VOICE_TEST_HAS_STREAM)
+    std::printf(
+        "  voice_test stream <wav> [--realtime|--no-realtime]\n"
+        "      Run full streaming VAD+ASR pipeline on <wav>.\n"
+        "\n");
+#endif
+    std::printf(
+        "Build-time component availability (controlled by CMake options):\n"
+        "  VOICE_TEST_HAS_VAD        = %d\n"
+        "  VOICE_TEST_HAS_ASR        = %d\n"
+        "  VOICE_TEST_HAS_TTS        = %d\n"
+        "  VOICE_TEST_HAS_STREAM     = %d\n",
+        VOICE_TEST_HAS_VAD_DEFINED,
+        VOICE_TEST_HAS_ASR_DEFINED,
+        VOICE_TEST_HAS_TTS_DEFINED,
+        VOICE_TEST_HAS_STREAM_DEFINED);
 }
 
 int main(int argc, char** argv) {
-#ifdef _WIN32
-    // UTF-8 console so Chinese ASR output is readable on Windows.
-    SetConsoleOutputCP(CP_UTF8);
-    SetConsoleCP(CP_UTF8);
-#endif
+#if defined(_WIN32)
+    // On Windows, re-parse the command line as UTF-16 then convert to UTF-8
+    // so Chinese text and CJK paths work regardless of the system code page.
+    int wargc = 0;
+    wchar_t** wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (wargv == nullptr || wargc < 1) {
+        std::fprintf(stderr, "Failed to parse command line\n");
+        return 1;
+    }
+    auto utf8_args = wargv_to_utf8(wargc, wargv);
+    LocalFree(wargv);
 
+    if (utf8_args.size() < 2) {
+        print_usage();
+        return 1;
+    }
+
+    const std::string sub = utf8_args[1];
+    std::vector<std::string> positional;
+    for (size_t i = 2; i < utf8_args.size(); ++i) {
+        positional.emplace_back(utf8_args[i]);
+    }
+#else
     if (argc < 2) {
         print_usage();
         return 1;
     }
 
-    std::string sub = argv[1];
-    std::vector<std::string> rest;
-    for (int i = 2; i < argc; ++i) rest.emplace_back(argv[i]);
-
-    if (sub == "help" || sub == "--help" || sub == "-h") {
-        print_usage();
-        return 0;
+    const std::string sub = argv[1];
+    std::vector<std::string> positional;
+    for (int i = 2; i < argc; ++i) {
+        positional.emplace_back(argv[i]);
     }
+#endif
 
-    ModelPaths mp;
-    auto positional = apply_model_overrides(rest, mp);
-
-    if (sub == "smoke") {
-        return run_smoke();
-    } else if (sub == "asr") {
-        return run_asr(positional, mp);
-    } else if (sub == "vad") {
-        return run_vad(positional, mp);
-    } else if (sub == "tts") {
-        return run_tts(positional, mp);
+    if (sub == "smoke" || sub == "-smoke" || sub == "--smoke") {
+        return run_smoke(positional);
     }
+#  if defined(VOICE_TEST_HAS_VAD)
+    if (sub == "vad") {
+        return run_vad(positional);
+    }
+#  endif
+#  if defined(VOICE_TEST_HAS_ASR)
+    if (sub == "asr") {
+        return run_asr(positional);
+    }
+#  endif
+#  if defined(VOICE_TEST_HAS_TTS)
+    if (sub == "tts") {
+        return run_tts(positional);
+    }
+#  endif
+#  if defined(VOICE_TEST_HAS_STREAM)
+    if (sub == "stream") {
+        return run_stream(positional);
+    }
+#  endif
 
-    std::fprintf(stderr, "unknown subcommand: %s\n", sub.c_str());
+    std::fprintf(stderr, "Unknown or unavailable subcommand: %s\n", sub.c_str());
     print_usage();
     return 1;
 }

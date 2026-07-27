@@ -8,7 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 if(MSVC)
     add_compile_options(/utf-8 /permissive- /W3)
-    add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN _USE_MATH_DEFINES)
     # Reduce noise from llama.cpp / sqlite
     add_compile_options(/wd4244 /wd4267 /wd4305 /wd4996)
 else()
@@ -111,8 +111,8 @@ if(WINEFOX_CORE_SOURCES_AND_HEADERS_EXIST)
     target_include_directories(winefox_core PUBLIC src)
 
     if(WINEFOX_VOICE_ENABLED)
-        # Phase 2+: sherpa-onnx + webrtc-apm wired in here.
-        # target_link_libraries(winefox_core PUBLIC sherpa-onnx ...)
+        # Phase 2+: voice front-end (onnxruntime VAD/TTS + ggml ASR) wired in here.
+        # target_link_libraries(winefox_core PUBLIC vad tts sensevoice ...)
     endif()
 endif()
 
@@ -134,4 +134,14 @@ endif()
 if(WINEFOX_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+# ---------------------------------------------------------------------------
+# voice-test: standalone voice front-end benchmark sandbox (Phase 2).
+# Independent of the winefox_core build; pulls in its own deps
+# (onnxruntime, ten-vad, SenseVoice.cpp, Kokoro) via its own CMakeLists.
+# Built only when explicitly requested to keep the heavy deps opt-in.
+# ---------------------------------------------------------------------------
+if(WINEFOX_BUILD_VOICE_TEST)
+    add_subdirectory(voice-test)
 endif()

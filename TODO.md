@@ -22,11 +22,18 @@
 
 - [x] llama.cpp：git submodule 接入 `third_party/llama.cpp`（pinned to release tag b10069），CMake `add_subdirectory`，验证 Windows x64 Release 构建
 - [x] **LLAMA_BUILD_COMMON=ON**：链接 `llama-common` 库（为使用 `common_chat_templates_apply` 支持 `enable_thinking=false`，等价 `llama-cli -rea off`，从源头禁止 Qwen3.5 生成 `<think>` 块）
-- [ ] sherpa-onnx：以 git submodule 接入 `third_party/sherpa-onnx`（Phase 2 接入，当前用 `WINEFOX_VOICE_ENABLED=OFF` 跳过）
+- [x] **新架构**：抛弃 sherpa-onnx 中间层，改为双后端直连：
+  - VAD：ten-vad 官方预编译库（**自包含**：ONNX 模型 + onnxruntime 已嵌入 `ten_vad.dll`，无需单独 onnxruntime）
+  - ASR：SenseVoice.cpp（ggml 后端，与 llama.cpp 共享 ggml）
+  - TTS：Kokoro ONNX + kokoro.cpp 的 G2P 前端（onnxruntime 后端，Phase 3 接入）
+  - 详见 `voice-test/README.md`
+- [x] onnxruntime：预编译包已接入 `voice-test/third_party/onnxruntime-prebuilt/`（Win x64，**仅 TTS 使用**，VAD 自包含）。Android arm64-v8a 待 Phase 6 接入。
+- [x] ten-vad：下载预编译库到 `voice-test/third_party/ten-vad/`（Win x64：`ten_vad.dll` 510KB + `ten_vad.lib` + `ten_vad.h`，自包含 onnxruntime + ONNX 模型）。Android arm64-v8a 待 Phase 6 接入。
+- [x] SenseVoice.cpp：git submodule 接入 `voice-test/third_party/sensevoice-cpp`（自带 ggml，voice-test 独立构建，避免与 llama.cpp 的 ggml target 冲突）
+- [x] kokoro.cpp：vendor 其 G2P 前端代码（ZHFrontend/ZHG2P/ToneSandhi/JiebaProcessor/EnG2P/Tokenizer）到 `voice-test/third_party/kokoro-cpp-src/`
 - [ ] webrtc-apm：克隆 WebRTC 源码，提取 AEC3 模块到 `third_party/webrtc-apm`（Phase 3 用，本阶段仅占位）
 - [x] SQLite：下载 amalgamation，放置 `third_party/sqlite/sqlite3.c` + `sqlite3.h`
 - [x] nlohmann/json：使用 llama.cpp vendor 目录中的版本（`third_party/llama.cpp/vendor/nlohmann/json.hpp`，3.12.0），避免与 common 库版本冲突
-- [ ] spdlog： submodule 接入（仅 DEBUG 构建链接，当前用内置 `WF_LOG_*` 宏替代）
 - [ ] GoogleTest：submodule 占位接入（Phase 1 MVP 跳过单元测试）
 
 ### 0.3 模型与素材准备
@@ -198,30 +205,58 @@
 
 ### 2.2 VAD 服务
 
-- [ ] `src/core/vad/vad_service.h/cpp`：封装 TEN-VAD
-  - frame_size=10ms, min_speech_duration=250ms, min_silence_duration=300ms
+- [x] **voice-test VAD 基准测试已通过**（`voice-test/src/vad_test.cpp`）：
+  - ten-vad 2.1.0 预编译库（自包含，无需 onnxruntime）
+  - 段状态机：hop=256 (16ms), min_speech=250ms, min_silence=300ms, max_speech=30s
+  - 性能：RTF=0.0112 (~89x realtime), avg 0.179ms/frame, p95 0.252ms
+  - 准确度：3/3 段检测正确，segment-level F1=1.0，frame-level F1=0.77（threshold=0.3）
+  - 详见 `voice-test/README.md` Phase 1 VAD benchmark summary
+- [ ] `src/core/vad/vad_service.h/cpp`：将 voice-test 中的状态机迁移为生产服务
+  - 调用 ten-vad 官方 C API（`ten_vad_create` / `ten_vad_process`）
+  - 自实现段状态机：frame_size=10ms, min_speech_duration=250ms, min_silence_duration=300ms
   - `on_speech_segment(cb)` 流式回调语音段
   - `on_interrupt(cb)` 用户开始说话时触发（用于打断 TTS/LLM）
 - [ ] 单元测试：喂入静音/语音混合音频，端点检测正确
 
 ### 2.3 ASR 服务
 
-- [ ] `src/core/asr/asr_service.h/cpp`：封装 sherpa-onnx SenseVoice-Small
+- [x] **voice-test ASR 基准测试已通过**（`voice-test/src/asr_test.cpp`）：
+  - SenseVoice.cpp (ggml) + sense-voice-small-q4_k.gguf (181.86 MB)
+  - 5 个中文测试句：avg RTF=0.269 (~3.7x realtime), avg CER=16.4%（含标点缺失误差）
+  - 内部时序：encoder 占 88.5%，feature 5.8%，decoder 5.6%
+  - 已知问题：「酒狐」→「九壶」同音字替换（无领域上下文时正常）
+  - 详见 `voice-test/README.md` Phase 2 ASR benchmark summary
+- [ ] `src/core/asr/asr_service.h/cpp`：封装 SenseVoice.cpp（ggml）
   - `on_partial_text(cb)` 流式部分识别
   - `on_final_text(cb)` 端点确认后完整文本
 - [ ] 单元测试：喂入中文音频，识别结果与预期一致
 
-### 2.4 TTS 服务（临时模型）
+### 2.4 TTS 服务（Kokoro）
 
-- [ ] `src/core/tts/tts_service.h/cpp`：封装 sherpa-onnx VITS
+- [x] **voice-test TTS 基准测试已通过**（`voice-test/src/tts_test.cpp`）：
+  - Kokoro (onnxruntime) + kokoro-v1.1-zh.onnx + voices-v1.1-zh.bin (103 voices)
+  - G2P 前端：kokoro.cpp (Jieba + PinyinFinder + ToneSandhi + EnG2P)
+  - 短文本 (14 字)：RTF=2.394；长文本 (122 字)：RTF=2.199
+  - 输出：24kHz mono float32 PCM
+  - 性能结论：RTF > 1.0（CPU-bound），需 Phase 5 蒸馏到轻量学生模型（目标 RTF ≤ 0.3）
+  - 详见 `voice-test/README.md` Phase 3 TTS benchmark summary
+- [ ] `src/core/tts/tts_service.h/cpp`：封装 Kokoro ONNX（onnxruntime）
+  - 调用 onnxruntime C API 推理 kokoro-v1.1-zh.onnx
+  - G2P 前端使用 kokoro.cpp 的 ZHFrontend/ZHG2P/ToneSandhi/JiebaProcessor
   - `synthesize_stream(text, on_audio, on_done)` 流式合成
   - `stop()` 用户打断时调用
   - 按句切分（句号/感叹号/问号/逗号），前段播放时后段并行合成
-- [ ] **临时使用 sherpa-onnx 内置中文 VITS 模型**（Phase 5 替换为酒狐音色）
 - [ ] 单元测试：合成音频长度合理、stop 立即生效
 
 ### 2.5 流式管线调度器
 
+- [x] **voice-test Stream 基准测试已通过**（`voice-test/src/stream_test.cpp`）：
+  - VAD (ten-vad) + ASR (SenseVoice.cpp) 流式管线，段状态机驱动
+  - 3/3 段正确识别："你好"、"今天天气真好"、"我们去散步吧"
+  - E2E 延迟：min=0.534s, avg=0.671s, p50=0.701s, p95=0.770s, max=0.777s
+  - 整体 RTF=0.1333 (7.50x realtime)，9.165s 音频 1.222s 处理完
+  - E2E 延迟 = VAD 端点延迟 (min_silence=0.30s) + ASR 推理时间
+  - 详见 `voice-test/README.md` Phase 4 Stream benchmark summary
 - [ ] `src/core/pipeline/pipeline_scheduler.h/cpp`：协调 VAD/ASR/LLM/TTS
   - VAD speech → 触发打断（停止 TTS、停止 LLM）
   - ASR final → 推入 ConversationManager
@@ -243,6 +278,11 @@
 - P50 首字延迟 ≤ 2.5s（埋点数据）
 - 用户说话能打断酒狐
 - Linux x64 同样可用（PulseAudio）
+
+> **voice-test 基准测试结论**：VAD+ASR 流式管线 E2E 延迟 p50≈0.70s，
+> 加上 LLM prefill (~0.45s 增量) + TTS 首块 (~0.4s)，预估对话首字延迟
+> p50 ≈ 1.55s，接近 P50 ≤ 1.5s 目标。TTS 是当前瓶颈（RTF > 2），需
+> Phase 5 蒸馏后才能达到生产级延迟。
 
 ---
 
@@ -371,18 +411,18 @@
 - [ ] 数据清洗：剔除发音错误/不自然样本，标注 emotion 标签
 - [ ] 切分 train/val (95/5)
 
-### 5.2 VITS-Tiny 蒸馏训练（离线，Colab GPU）
+### 5.2 Kokoro 蒸馏训练（离线，Colab GPU）
 
-- [ ] `tts-training/vits_tiny/`：训练代码目录
-- [ ] VITS-Tiny 模型定义（参数量 5-15M）
+- [ ] `tts-training/kokoro_distill/`：训练代码目录
+- [ ] Kokoro-82M 学生模型加载（或定义 Kokoro-Tiny 20-40M）
 - [ ] 蒸馏损失：mel-spectrogram L1 + KL + adversarial + **speaker embedding 一致性**
-- [ ] `tts-training/vits_tiny/train.py`：训练脚本
+- [ ] `tts-training/kokoro_distill/train.py`：训练脚本
 - [ ] 训练并评估：自然度、音色相似度、RTF
-- [ ] 保留 sherpa-onnx 内置 TTS 作为 fallback（对齐 [11.2.5](./PLAN.md#L884-L891)）
+- [ ] 保留官方 Kokoro-82M 模型作为 fallback（对齐 [11.2.5](./PLAN.md#L884-L891)）
 
 ### 5.3 ONNX 导出与集成
 
-- [ ] `tts-training/vits_tiny/export_onnx.py`：导出 ONNX（INT8 量化）
+- [ ] `tts-training/kokoro_distill/export_onnx.py`：导出 ONNX（INT8 量化）
 - [ ] 验证 ONNX 输出与 PyTorch 一致
 - [ ] 替换 TtsService 模型路径
 - [ ] 端到端测试：语音对话使用酒狐音色

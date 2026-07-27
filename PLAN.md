@@ -59,10 +59,45 @@ TTS 首音块:         150-400 ms
 ### 0.5 TTS 方案细化
 
 - **数据集生成**：使用 CosyVoice 跨语言克隆酒狐日语音色 → 生成中文平行语料（一次性，离线 GPU 或 Colab 完成）。
-- **蒸馏训练**：使用 **VITS-Tiny** 作为学生模型，对 CosyVoice 生成的酒狐音色音频做蒸馏学习，得到轻量的酒狐音色 TTS 模型。
-- **在线推理**：将蒸馏后的 VITS-Tiny 导出为 ONNX，交 sherpa-onnx 推理。
+- **蒸馏训练**：使用 **Kokoro-82M** 作为学生模型（或进一步蒸馏出 Kokoro-Tiny），对 CosyVoice 生成的酒狐音色音频做蒸馏学习，得到轻量的酒狐音色 TTS 模型。
+- **在线推理**：将蒸馏后的模型导出为 ONNX，交 onnxruntime 推理（与 VAD 共享同一 onnxruntime 实例）。
 - **不使用 GPT-SoVITS**：其 autoregressive 部分对 CPU 实时性不友好，仅在前期实验阶段曾用作对比基线，正式方案中移除。
-- **VITS-Tiny 优势**：参数量小、CPU 推理快、易导出 ONNX、sherpa-onnx 原生支持，符合极致轻量化目标。
+- **Kokoro-82M 优势**：Apache 2.0 开源、SOTA 中文质量、82M 参数端侧可承受、ONNX 导出成熟，现直接用 onnxruntime + kokoro.cpp G2P 前端自建推理。
+
+#### 0.5.1 TTS 推理后端决策（2026-07-27）
+
+经过对比测试，**TTS 推理后端确定为 ONNX Runtime，放弃 ggml 路径**。
+
+| 后端 | RTF (long text) | 备注 |
+|---|---|---|
+| ggml decoder (threads=8, 已优化) | **3.07** | 见下文瓶颈分析 |
+| ONNX split FP32 decoder (t=8) | 0.81 | baseline（Python ORT 基准） |
+| ONNX split INT8-static decoder (Python ORT, t=8) | 0.73 | 1.32x 实时 |
+| **ONNX split INT8-static decoder (C++ ORT, t=8)** | **0.67** | **正式采用**，1.50x 实时 |
+
+**ggml 路径瓶颈**（详见 `voice-test/_archive_ggml/README.md`）：
+1. `ggml_compute_forward_repeat_f32` 对 `ne[0]=1` 的 tensor 逐元素循环，无法并行。
+2. 2171 个计算节点 × per-node barrier 同步，调度开销大。
+3. ggml 的 im2col 仅在特定 shape 下生效，iSTFTNet 的 stride/kernel 组合未命中优化路径。
+4. instance_norm / snake / adain_resblock 等组合算子无 fused 实现，每次拆解引入额外中间 tensor 和 barrier。
+
+**结论**：ggml 不是为卷积优化的，iSTFTNet 这种 conv-heavy decoder 在 ggml 上无法发挥优势。继续优化 ggml 路径投入产出比低，决定归档相关代码（`voice-test/_archive_ggml/`），专注 ONNX Runtime 优化。
+
+**ONNX Runtime 优化路线**：
+- [x] split 模式（encoder FP32 + decoder INT8-static），C++ 实测 1.50x 实时
+- [x] warmup 推理：构造时虚拟 forward，预编译执行计划，首包延迟降 47%
+- [x] 线程数自动配置：使用 logical cores，clamp [4, 8]（ORT 在 SMT 上比 ggml 表现好）
+  - thread sweep 实测（4C8T CPU，INT8-static decoder，15.65s 音频）：
+    - t=4 → RTF 0.75（1.33x realtime）
+    - t=6 → RTF 0.65（1.53x realtime）最优
+    - t=8 → RTF 0.67（1.50x realtime）
+- [x] SessionOptions：启用 CpuMemArena + MemPattern，动态 shape 性能提升 ~30%
+- [x] 流式合成：按句末标点分块，TTFB 6379ms → 3419ms
+- [x] Buffer 复用：tokens/style/speed 缓冲区作为成员变量，streaming 模式避免每次 chunk 重复 alloc
+- [x] 静态 input/output names：避免每次 Run 重建 char* 数组
+- [x] mem_info 缓存：避免每次 _create_audio_split 重新 CreateCpu
+- [ ] IO binding：预分配输入输出 buffer（CPU 场景收益有限，GPU 场景才显著）
+- [ ] 算子融合：检查 ONNX 模型是否可应用 conv+norm+activation 融合
 
 ### 0.6 Live2D 替代方案与渲染层统一
 
@@ -166,12 +201,20 @@ TTS 首音块:         150-400 ms
 │  └──────────┴──────────┴──────────┴──────────┘         │
 ├─────────────────────────────────────────────────────────┤
 │  后端层                                                  │
-│  - llama.cpp (LLM + Embedding)                          │
-│  - sherpa-onnx (ASR + TTS + VAD)                        │
+│  - llama.cpp (LLM + Embedding)         [ggml]           │
+│  - SenseVoice.cpp (ASR)                [ggml]           │
+│  - ten-vad (VAD)                       [onnxruntime]    │
+│  - Kokoro (TTS)                        [onnxruntime]    │
 │  - webrtc-audio-processing (AEC3)                       │
 │  - SQLite3 (存储)                                       │
 └─────────────────────────────────────────────────────────┘
 ```
+
+> **架构演进**：原方案用 sherpa-onnx 统一封装 ASR/VAD/TTS，现改为双后端直连：
+> - **ggml 后端**：llama.cpp (LLM) + SenseVoice.cpp (ASR) 共享 `ggml.dll`
+> - **onnxruntime 后端**：ten-vad (VAD) + Kokoro (TTS) 共享 `onnxruntime.dll`
+> - 最终可拆为 `ggml.dll` / `llm.dll` / `sensevoice.dll` / `vad.dll` / `tts.dll` 运行时动态链接
+> - 详见 `voice-test/README.md`
 
 ### 2.2 目录结构
 
@@ -181,10 +224,10 @@ winefox/
 ├── PLAN.md                       # 本文件
 ├── src/
 │   ├── core/                     # 跨平台核心
-│   │   ├── llm/                  # LLM 服务（封装 llama.cpp）
-│   │   ├── asr/                  # ASR 服务（封装 sherpa-onnx）
-│   │   ├── tts/                  # TTS 服务
-│   │   ├── vad/                  # VAD 服务
+│   │   ├── llm/                  # LLM 服务（封装 llama.cpp, ggml）
+│   │   ├── asr/                  # ASR 服务（封装 SenseVoice.cpp, ggml）
+│   │   ├── tts/                  # TTS 服务（封装 Kokoro, onnxruntime）
+│   │   ├── vad/                  # VAD 服务（封装 ten-vad, onnxruntime）
 │   │   ├── aec/                  # AEC 服务
 │   │   ├── memory/               # 记忆服务（短期 + 长期）
 │   │   ├── embedder/             # 向量嵌入
@@ -201,8 +244,11 @@ winefox/
 │   │   └── input/                # 交互
 │   └── app/                      # 应用入口
 ├── third_party/
-│   ├── llama.cpp/                # git submodule
-│   ├── sherpa-onnx/              # git submodule
+│   ├── llama.cpp/                # git submodule (ggml + LLM)
+│   ├── sensevoice-cpp/           # git submodule (ggml ASR)
+│   ├── onnxruntime/              # prebuilt package (VAD + TTS backend)
+│   ├── ten-vad/                  # prebuilt lib (VAD)
+│   ├── kokoro-cpp/               # vendored G2P frontend (TTS)
 │   ├── webrtc-apm/               # AEC3 提取模块
 │   ├── sqlite/                   # sqlite3.c + sqlite3.h
 │   └── json/                     # nlohmann/json
@@ -420,10 +466,20 @@ public:
 ```
 
 **实现要点**：
-- 模型：VITS-Tiny 蒸馏版（中文，酒狐音色），INT8 ONNX。
-- 数据集：CosyVoice 跨语言克隆酒狐日语音色生成中文平行语料（一次性，Colab GPU），目标 ≥ 5 小时。
-- 蒸馏：VITS-Tiny 作为学生模型，学习 CosyVoice 教师模型的酒狐音色。
-- 流式：按句子切分（句号/感叹号/问号/逗号），每段独立合成，前段播放时后段并行合成。
+- **模型**：Kokoro-82M（中文，酒狐音色待 Phase 5 蒸馏替换），split 模式（encoder FP32 + decoder INT8-static）。
+- **推理后端**：ONNX Runtime（详见 [0.5.1 节](#L67)）。ggml 路径已废弃并归档到 `voice-test/_archive_ggml/`。
+- **split 模式架构**：
+  - encoder ONNX：PLBERT + text encoder + duration/F0/N predictors（FP32，4 线程）
+  - decoder ONNX：iSTFTNet（INT8-static 量化，8 线程，conv-heavy 并行好）
+  - 中间张量 zero-copy 传递（ORT 持有 buffer，encoder 输出直接喂给 decoder）
+- **流式合成**：按句末标点（`.!?`）立即分块，clause 标点（`,;`）延迟分块，超过 `MAX_PHONEME_LENGTH` (510) 强制切分。前段播放时后段并行合成。
+- **性能基准**（Phase 2 voice-test 实测，4C8T CPU，32.4s 长文本流式合成）：
+  - INT8 decoder + FP32 encoder，dec_threads=8：**RTF = 0.67（1.50x 实时）**
+  - 首包延迟 TTFB：3419ms（含 warmup 后的首次推理）
+  - 总耗时：21.56s（音频 32.4s，合成 21.56s）
+  - 6 个 chunk 稳定分块，每 chunk RTF 在 0.65–0.71 之间
+- **数据集**：CosyVoice 跨语言克隆酒狐日语音色生成中文平行语料（一次性，Colab GPU），目标 ≥ 5 小时。
+- **蒸馏**：Kokoro-82M 作为学生模型，学习 CosyVoice 教师模型的酒狐音色。
 
 ### 3.4 记忆服务
 
@@ -716,11 +772,11 @@ public:
    - 输入：文本 + 教师音频（作为蒸馏目标）
    - 损失：mel-spectrogram L1 + KL + adversarial + speaker embedding 一致性
    - 目标：学生模型学习教师模型的酒狐音色，但推理速度更快
-7. 导出 ONNX 供 sherpa-onnx 使用
+7. 导出 ONNX 供 onnxruntime 使用
 ```
 
-**VITS-Tiny 蒸馏训练要点**：
-- 学生模型：VITS-Tiny（参数量约 5-15M，远小于标准 VITS）
+**Kokoro 蒸馏训练要点**：
+- 学生模型：Kokoro-82M（或进一步蒸馏出 Kokoro-Tiny，参数量约 20-40M）
 - 教师模型：CosyVoice（仅用于离线生成数据，不参与线上推理）
 - 单说话人（酒狐）
 - 目标推理速度：CPU RTF ≤ 0.3（即 1s 音频合成 ≤ 0.3s，远快于实时）
@@ -729,7 +785,7 @@ public:
 
 ### 5.3 ASR 模型
 
-直接使用 sherpa-onnx 提供的 SenseVoice-Small 预训练 INT8 模型，无需训练。
+直接使用 SenseVoice.cpp 提供的 SenseVoice-Small 预训练 GGUF 模型（Q4_K / Q8 量化），无需训练。
 
 ---
 
@@ -844,7 +900,7 @@ public:
 - [ ] AudioIo (WASAPI)
 - [ ] VadService（TEN-VAD）
 - [ ] AsrService（SenseVoice-Small）
-- [ ] TtsService（自训 VITS，先临时用 sherpa-onnx 内置模型）
+- [ ] TtsService（Kokoro-82M 官方模型，后续蒸馏替换为酒狐音色）
 - [ ] PipelineScheduler 流式管线
 - [ ] 用户打断逻辑
 
@@ -917,7 +973,7 @@ public:
 | 风险 | 影响 | 应对 |
 |------|------|------|
 | 老旧 CPU 性能不达标 | 高 | 分级 preset，0.6B 起步，文档明确最低配置 |
-| TTS 自训音色不自然 | 中 | 保留 sherpa-onnx 内置 VITS 作为 fallback |
+| TTS 自训音色不自然 | 中 | 保留官方 Kokoro-82M 作为 fallback |
 | AEC3 跨平台不一致 | 中 | 默认关闭，提供手动校准向导 |
 | LoRA 训练效果不佳 | 中 | 扩充数据集到 5000+，调整 rank/alpha |
 | 内存超标 | 中 | 模型按需加载，embedding/ASR 可选降级 |
@@ -958,11 +1014,13 @@ public:
 ## 10. 参考资料
 
 - llama.cpp: https://github.com/ggml-org/llama.cpp
-- sherpa-onnx: https://github.com/k2-fsa/sherpa-onnx
-- TEN-VAD: https://github.com/TEN-framework/ten-vad
+- SenseVoice.cpp (ggml ASR): https://github.com/lovemefan/SenseVoice.cpp
+- TEN-VAD (onnxruntime VAD): https://github.com/TEN-framework/ten-vad
+- onnxruntime: https://github.com/microsoft/onnxruntime
+- Kokoro-82M (TTS 模型): https://huggingface.co/hexgrad/Kokoro-82M
+- kokoro.cpp (G2P 前端参考): https://github.com/koth/kokoro.cpp
 - WebRTC AEC3: https://chromium.googlesource.com/chromium/src/+/refs/heads/main/third_party/webrtc/modules/audio_processing/aec3/
 - CosyVoice (教师模型): https://github.com/FunAudioLLM/CosyVoice
-- VITS-Tiny (学生模型，蒸馏目标): https://github.com/jaywalnut310/vits (基础 VITS，Tiny 为轻量化变体)
 - BlockBench 模型格式: https://blockbench.net/wiki/api/project
 - Qwen3.5 模型: https://huggingface.co/Qwen
 - bge-small-zh: https://huggingface.co/BAAI/bge-small-zh-v1.5
@@ -991,7 +1049,7 @@ public:
 
 #### 11.2.1 跨平台构建应进一步收敛起步范围
 
-**问题**：8 个平台组合（Win x86/x64/arm64 + Android arm64 + Linux x86/x64/arm64/arm32）的 CI 矩阵和本地验证成本极高，第三方依赖（llama.cpp、sherpa-onnx、webrtc-apm）在 arm32/arm64 上的构建脚本调试可能消耗大量时间。
+**问题**：8 个平台组合（Win x86/x64/arm64 + Android arm64 + Linux x86/x64/arm64/arm32）的 CI 矩阵和本地验证成本极高，第三方依赖（llama.cpp、SenseVoice.cpp、onnxruntime、ten-vad、webrtc-apm）在 arm32/arm64 上的构建脚本调试可能消耗大量时间。
 
 **建议**：
 - Phase 1-5 仅锁定 **Windows x64 + Linux x64** 两个主开发平台。
@@ -1028,8 +1086,8 @@ public:
 
 **建议**：
 - 蒸馏前先人工评估 CosyVoice 生成的中文音频音色相似度，不达标则调整参考音频或换用其他克隆方案。
-- VITS-Tiny 蒸馏时加入 speaker embedding 一致性损失，强制保留音色。
-- 保留 sherpa-onnx 内置中文 TTS 作为 fallback，确保功能可用。
+- Kokoro 蒸馏时加入 speaker embedding 一致性损失，强制保留音色。
+- 保留官方 Kokoro-82M 作为 fallback，确保功能可用。
 
 #### 11.2.6 内存预算在 arm32 上仍需关注
 
