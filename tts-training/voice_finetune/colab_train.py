@@ -53,7 +53,14 @@ def run(cmd, check=True, cwd=None):
 
 
 def step_setup():
-    """Step 1: 环境准备。"""
+    """Step 1: 环境准备。
+
+    Colab 预装环境（2026-07 实测）已包含：
+      - kokoro 0.9.4, misaki 0.9.4, librosa, soundfile, huggingface_hub
+      - torch 2.3.1+cu121, torchaudio 2.3.1+cu121, transformers 5.x, numpy 2.x
+    因此 Kokoro 训练依赖无需安装，只部署模型权重。
+    CosyVoice 依赖由 cosyvoice_setup.py --system-python 智能补装缺失包。
+    """
     print('=' * 60)
     print('Step 1: 环境准备')
     print('=' * 60)
@@ -64,25 +71,23 @@ def step_setup():
     else:
         print(f'仓库已存在: {WINEFOX_DIR}')
 
-    # 1.2 安装依赖（Kokoro 训练用，CosyVoice 依赖由 cosyvoice_setup.py 装）
-    print('\n安装 Python 依赖（Kokoro 训练用）...')
-    run('pip install -q kokoro>=0.8 soundfile librosa huggingface_hub')
-    run('pip install -q misaki[zh]')
+    # 1.2 检查 Colab 预装的关键包（仅打印，不安装）
+    print('\n检查 Colab 预装包...')
+    run('python -c "'
+        'import torch, librosa, soundfile, kokoro; '
+        'print(f\'torch={torch.__version__}, CUDA={torch.cuda.is_available()}\'); '
+        'print(f\'kokoro={kokoro.__version__}, librosa={librosa.__version__}\'); '
+        'print(f\'GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else "无"}\')'
+        '"')
 
-    # 1.3 检查 GPU
-    print('\n检查 GPU...')
-    run('nvidia-smi')
-    run('python -c "import torch; print(f\'CUDA: {torch.cuda.is_available()}, Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else None}\')"')
-
-    # 1.4 部署 Kokoro 模型
+    # 1.3 部署 Kokoro 模型（仅下载权重，依赖已预装）
     print('\n下载 Kokoro 模型...')
     run(f'cd {WINEFOX_DIR} && python tts-training/voice_finetune/setup_kokoro.py --check',
         check=False)
     run(f'cd {WINEFOX_DIR} && python tts-training/voice_finetune/setup_kokoro.py')
 
-    # 1.5 部署 CosyVoice（用于数据集生成）
-    # Colab 上无法用 venv（ensurepip 不可用），用 --system-python 直接装到系统 Python
-    print('\n部署 CosyVoice2（--system-python 模式，Colab 兼容）...')
+    # 1.4 部署 CosyVoice（--system-python 模式智能补装缺失包）
+    print('\n部署 CosyVoice2（--system-python 智能补装）...')
     run(f'cd {WINEFOX_DIR} && python tts-training/cosyvoice_setup.py --system-python --check',
         check=False)
     run(f'cd {WINEFOX_DIR} && python tts-training/cosyvoice_setup.py --system-python')

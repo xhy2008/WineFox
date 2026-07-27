@@ -100,71 +100,137 @@ def create_venv(use_system_python=False):
     return str(venv_python)
 
 
+def _is_pkg_installed(venv_python, pkg_name):
+    """检查指定包是否已安装（通过 importlib.metadata）。"""
+    try:
+        result = subprocess.run(
+            [str(venv_python), '-c',
+             f'import importlib.metadata; importlib.metadata.version("{pkg_name}"); print("OK")'],
+            capture_output=True, text=True, timeout=10
+        )
+        return result.returncode == 0 and 'OK' in result.stdout
+    except Exception:
+        return False
+
+
+def _get_installed_version(venv_python, pkg_name):
+    """获取已安装包的版本号，未安装返回 None。"""
+    try:
+        result = subprocess.run(
+            [str(venv_python), '-c',
+             f'import importlib.metadata; print(importlib.metadata.version("{pkg_name}"))'],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+# Colab 预装环境（基于 2026-07 实测 req.txt）中已存在的包及其版本。
+# 这些包无需重装，重装可能触发依赖冲突（transformers 5.x vs 4.x、numpy 2.x vs 1.x 等）。
+# key: 包名（小写），value: Colab 预装版本
+COLAB_PREINSTALLED = {
+    'torch': '2.3.1+cu121',
+    'torchaudio': '2.3.1+cu121',
+    'transformers': '5.13.1',
+    'numpy': '2.0.2',
+    'protobuf': '5.29.6',
+    'librosa': '0.11.0',
+    'soundfile': '0.14.0',
+    'omegaconf': '2.3.1',
+    'hydra-core': None,  # 未预装
+    'networkx': '3.6.1',
+    'matplotlib': '3.10.0',
+    'rich': '13.9.4',
+    'pydantic': '2.13.4',
+    'pyarrow': '18.1.0',
+    'tensorboard': '2.20.0',
+    'inflect': '7.5.0',
+    'gdown': '5.2.2',
+    'gradio': '6.20.0',
+    'grpcio': '1.82.1',
+    'fastapi': '0.139.0',
+    'uvicorn': '0.51.0',
+    'diffusers': '0.39.0',
+    'click': '8.4.2',
+    'pillow': '11.3.0',
+    'scipy': '1.16.3',
+    'scikit-learn': '1.6.1',
+    'pandas': '2.2.2',
+    'tqdm': '4.67.3',
+    'requests': '2.32.4',
+    'huggingface_hub': '1.23.0',
+    'safetensors': '0.8.0',
+    'tokenizers': '0.22.2',
+    'sentencepiece': '0.2.2',
+}
+
+# CosyVoice 推理路径（cosyvoice_dataset/generate.py）真正需要的包。
+# 从 requirements.txt 中筛选出运行时 import 的核心依赖，剔除训练/部署专用包。
+# 这些包若 Colab 未预装，则需要安装。
+COSYVOICE_RUNTIME_DEPS = [
+    # 包名（pip 名）, import 名, 是否必需
+    ('conformer', 'conformer', True),
+    ('HyperPyYAML', 'hyperpyyaml', True),
+    ('hydra-core', 'hydra', True),
+    ('modelscope', 'modelscope', True),  # 下载模型必需
+    ('wetext', 'wetext', True),  # 中文文本规范化（ttsfrd 替代）
+    ('x-transformers', 'x_transformers', True),  # 模型结构
+    ('onnxruntime-gpu', 'onnxruntime', False),  # 可选，GPU 加速
+    ('pyworld', 'pyworld', False),  # 可选，音频分析
+    ('wget', 'wget', False),  # 可选，下载工具
+    ('lightning', 'lightning', False),  # 训练才用，推理可跳过
+    ('deepspeed', 'deepspeed', False),  # 训练才用
+]
+
+
 def install_deps(venv_python, use_system_python=False):
     """安装依赖。
 
-    官方 requirements.txt 钉死 Python 3.10 + torch 2.3.1。在 Python 3.11 上：
-      - 大部分包兼容（numpy/torchaudio/transformers/onnxruntime 等）。
-      - deepspeed / tensorrt-cu12 标记了 sys_platform=='linux'，Windows 自动跳过。
-      - ttsfrd 是 cp310 wheel，仅用于文本规范化（可选），未安装时回落到 wetext。
-      - sox 训练数据预处理才需要，推理路径不依赖，跳过。
+    两种模式：
+      1. 本地 Windows（use_system_python=False）：创建 venv，装 CPU 版 torch，
+         按 requirements.filtered.txt 装全部依赖（阿里云镜像）。
+      2. Colab（use_system_python=True）：不创建 venv，直接用系统 Python。
+         Colab 已预装 torch 2.3.1+cu121 / transformers 5.x / numpy 2.x 等，
+         只补装 CosyVoice 推理缺失的小包，避免降级触发依赖冲突。
 
-    策略差异：
-      - 本地 Windows（AMD GPU，CUDA 不可用）：单独装 CPU 版 torch/torchaudio，
-        避免从 cu121 索引拉 ~2.5GB CUDA wheel。
-      - Colab（NVIDIA T4 GPU）：直接装 CUDA 版 torch，并保留官方 requirements.txt
-        中的 torch==2.3.1（cu121 索引），让 GPU 可用。
+    关键：Colab 模式不重装 torch/transformers/numpy/protobuf，即使版本与
+    CosyVoice requirements.txt 不一致。实测 CosyVoice2-0.5B 推理在
+    transformers 5.x + numpy 2.x 下可正常工作（仅 warnings）。
     """
     req = REPO_DIR / 'requirements.txt'
     if not req.exists():
         raise RuntimeError(f'未找到 requirements.txt: {req}')
 
-    # 生成过滤后的 requirements（移除 torch/torchaudio/extra-index-url）
-    filtered = DEPLOY_DIR / 'requirements.filtered.txt'
-    # 跳过的包：
-    #   torch / torchaudio  -- 已单独安装（CPU 或 CUDA 版）
-    #   openai-whisper      -- 老式 setup.py 依赖 pkg_resources（new setuptools 移除），
-    #                          仅用于 ASR 转写，跨语言音色克隆推理路径不需要
-    #   sox                 -- 训练数据预处理才用，推理路径不需要
-    #   ttsfrd              -- cp310 wheel，Python 3.11 不可用，回落到 wetext
-    skip_pkgs = {'torch', 'torchaudio', 'openai-whisper', 'sox', 'ttsfrd'}
-    kept = []
-    with req.open('r', encoding='utf-8') as f:
-        for line in f:
-            s = line.strip()
-            if not s or s.startswith('#'):
-                continue
-            if s.startswith('--'):  # 移除所有 --extra-index-url / --index-url
-                continue
-            # 取包名（== 前的部分，忽略环境标记 ; ...）
-            pkg = s.split('==')[0].split('>=')[0].split('<=')[0].split('!=')[0].split('~=')[0].split('>')[0].split('<')[0].strip().lower()
-            if pkg in skip_pkgs:
-                print(f'  [skip] {s}')
-                continue
-            kept.append(s)
-    with filtered.open('w', encoding='utf-8') as f:
-        f.write('# Auto-generated by cosyvoice_setup.py\n')
-        f.write('# - torch/torchaudio 已单独安装\n')
-        f.write('# - 移除 --extra-index-url（避免拉取 cu121 索引）\n')
-        f.write('# - 跳过 openai-whisper（构建失败，推理路径不需要）\n')
-        for line in kept:
-            f.write(line + '\n')
-    print(f'过滤后依赖写入: {filtered}（共 {len(kept)} 条）')
+    if not use_system_python:
+        # ===== 本地 Windows 模式：完整 venv 安装（原逻辑） =====
+        # 生成过滤后的 requirements（移除 torch/torchaudio/extra-index-url）
+        filtered = DEPLOY_DIR / 'requirements.filtered.txt'
+        skip_pkgs = {'torch', 'torchaudio', 'openai-whisper', 'sox', 'ttsfrd'}
+        kept = []
+        with req.open('r', encoding='utf-8') as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith('#'):
+                    continue
+                if s.startswith('--'):
+                    continue
+                pkg = s.split('==')[0].split('>=')[0].split('<=')[0].split('!=')[0].split('~=')[0].split('>')[0].split('<')[0].strip().lower()
+                if pkg in skip_pkgs:
+                    print(f'  [skip] {s}')
+                    continue
+                kept.append(s)
+        with filtered.open('w', encoding='utf-8') as f:
+            f.write('# Auto-generated by cosyvoice_setup.py\n')
+            f.write('# - torch/torchaudio 已单独安装 CPU 版\n')
+            f.write('# - 移除 --extra-index-url\n')
+            f.write('# - 跳过 openai-whisper / sox / ttsfrd\n')
+            for line in kept:
+                f.write(line + '\n')
+        print(f'过滤后依赖写入: {filtered}（共 {len(kept)} 条）')
 
-    if use_system_python:
-        # Colab 模式：装 CUDA 版 torch（cu121 索引）
-        step('安装 CUDA 版 torch + torchaudio（Colab GPU）')
-        run([
-            str(venv_python), '-m', 'pip', 'install', '-q',
-            'torch==2.3.1', 'torchaudio==2.3.1',
-            '--index-url', 'https://download.pytorch.org/whl/cu121',
-        ])
-        step('安装其余依赖')
-        run([
-            str(venv_python), '-m', 'pip', 'install', '-q', '-r', str(filtered),
-        ])
-    else:
-        # 本地 Windows 模式：CPU 版 torch
         step('安装 CPU 版 torch + torchaudio（避免拉取 ~2.5GB CUDA wheel）')
         run([
             str(venv_python), '-m', 'pip', 'install',
@@ -172,12 +238,69 @@ def install_deps(venv_python, use_system_python=False):
             '--index-url', 'https://download.pytorch.org/whl/cpu',
         ])
         step('安装其余依赖（首次约 5-10 分钟）')
-        # 使用阿里云镜像（清华镜像缺 conformer==0.3.2）
         run([
             str(venv_python), '-m', 'pip', 'install', '-r', str(filtered),
             '-i', 'https://mirrors.aliyun.com/pypi/simple',
             '--trusted-host', 'mirrors.aliyun.com',
         ])
+        return
+
+    # ===== Colab 模式：智能补装缺失包 =====
+    step('Colab 模式：检查已预装的包')
+    print(f'  Colab 预装 torch={_get_installed_version(venv_python, "torch")}, '
+          f'torchaudio={_get_installed_version(venv_python, "torchaudio")}, '
+          f'transformers={_get_installed_version(venv_python, "transformers")}, '
+          f'numpy={_get_installed_version(venv_python, "numpy")}')
+    print('  → 保留 Colab 预装版本，不降级（避免依赖冲突）')
+
+    # 检查每个运行时依赖是否已安装
+    to_install = []
+    skip_count = 0
+    for pip_name, import_name, required in COSYVOICE_RUNTIME_DEPS:
+        # 优先用 import 名检查（有些 pip 名和 import 名不同）
+        installed = _is_pkg_installed(venv_python, import_name)
+        if installed:
+            ver = _get_installed_version(venv_python, import_name) or '?'
+            print(f'  [OK]    {pip_name} ({ver})')
+            skip_count += 1
+        elif required:
+            print(f'  [MISS]  {pip_name} (必需，将安装)')
+            to_install.append(pip_name)
+        else:
+            print(f'  [MISS]  {pip_name} (可选，跳过)')
+
+    print(f'\n  已预装: {skip_count}/{len(COSYVOICE_RUNTIME_DEPS)}，'
+          f'需安装: {len(to_install)}')
+
+    if not to_install:
+        print('  所有必需依赖已就绪，无需安装')
+        return
+
+    # 安装缺失包。使用 --no-deps 避免连带降级已预装的包（如 transformers/numpy）。
+    # conformer / x-transformers 等小包无强依赖，--no-deps 安全。
+    # modelscope 依赖较多，不能用 --no-deps，但它的依赖大部分 Colab 已预装。
+    step(f'安装 {len(to_install)} 个缺失包（--no-deps 避免降级冲突）')
+
+    # modelscope 需要正常安装（依赖 requests、protobuf 等，Colab 已预装）
+    normal_install = [p for p in to_install if p == 'modelscope']
+    no_deps_install = [p for p in to_install if p != 'modelscope']
+
+    if normal_install:
+        print(f'  正常安装（含依赖）: {normal_install}')
+        run([str(venv_python), '-m', 'pip', 'install', '-q'] + normal_install)
+
+    if no_deps_install:
+        print(f'  --no-deps 安装: {no_deps_install}')
+        run([str(venv_python), '-m', 'pip', 'install', '-q', '--no-deps'] + no_deps_install)
+
+    # 验证安装结果
+    print('\n  验证安装:')
+    for pip_name, import_name, required in COSYVOICE_RUNTIME_DEPS:
+        if not required:
+            continue
+        ok = _is_pkg_installed(venv_python, import_name)
+        flag = 'OK' if ok else 'FAIL'
+        print(f'    [{flag}] {pip_name}')
 
 
 def download_model(venv_python):
