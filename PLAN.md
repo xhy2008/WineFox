@@ -99,14 +99,37 @@ TTS 首音块:         150-400 ms
 - [ ] IO binding：预分配输入输出 buffer（CPU 场景收益有限，GPU 场景才显著）
 - [ ] 算子融合：检查 ONNX 模型是否可应用 conv+norm+activation 融合
 
-### 0.6 Live2D 替代方案与渲染层统一
+### 0.6 3D World 渲染方案（Vulkan + SDL3 + Box3D）
 
-- 用户已有 `WineFoxModel/模型文件/人物模型/*.bbmodel`（BlockBench 基岩版模型 + 动画）。
-- **改进**：自研轻量 `bbmodel` 渲染器（骨骼动画 + 表情切换），不引入 Live2D / Spine / DragonBones。
-  - **渲染层统一为 GLES3**：Windows 和 Android 都用 OpenGL ES 3.0，避免为不同平台维护两套渲染接口（D3D11 + GLES3）。Windows 上通过原生 GLES3 驱动（绝大多数现代 GPU 均支持）或 ANGLE 兜底。
-  - Linux 无 GUI，不涉及渲染。
-  - 动作集：从 bbmodel 自带动画提取，按 emotion 标签映射。
-  - 优势：单一渲染代码路径，降低开发与维护复杂度；D3D11 的开发与调试成本过高，对本项目收益有限。
+原方案的 GLES3 + bbmodel 2D 渲染层已替换为 **纯 C++ + Vulkan 3D 世界**方案。用户走进虚拟世界与酒狐互动，而非将酒狐投射到现实世界。
+
+**技术选型**：
+
+| 组件 | 选择 | 理由 |
+|------|------|------|
+| 图形 API | Vulkan 1.3 + Vulkan-HPP | 用户要求，RAII 安全 |
+| 窗口/输入 | SDL3 | 跨平台，原生 Vulkan surface 支持，内置音频 |
+| 物理 | Box3D (github.com/erincatto/box3d) | Erin Catto 新作，纯 C17 零依赖，编译快，内置 Character mover |
+| glTF 加载 | tinygltf (header-only) | 解析 .glb/.gltf 场景模型 |
+| 内存分配 | VMA (header-only) | Vulkan 子分配器 |
+| 几何优化 | meshoptimizer | 顶点缓存/overdraw 优化 |
+| 数学库 | glm | 与 GLSL 语法一致 |
+| 着色器 | shaderc (运行时) / glslangValidator (离线) | GLSL→SPIR-V |
+| 调试 UI | Dear ImGui | 设置面板/调试 overlay |
+| 角色格式 | bbmodel (Phase 4C) + VRM (Phase 4F) | 先跑通 bbmodel，后续支持 VRM |
+
+**与现有项目的关系**：3D World 是新的前端层，替换原 Phase 4 的 GLES3+bbmodel。AI 核心（LLM+语音+记忆）完全保留，通过同进程多线程通信。
+
+**渲染管线**（Forward PBR）：
+1. 阴影 Pass（方向光 → 2048² 深度图）
+2. 主 Pass（glTF 场景 + bbmodel 角色，PBR Cook-Torrance + IBL + 阴影采样）
+3. 透明 Pass（玻璃/水面）
+4. 后处理（Tone mapping ACES + Bloom）
+5. UI Pass（ImGui）
+
+**物理系统**：Box3D MeshShape 吃 glTF 三角网格做静态碰撞，Character mover 做第一人称角色控制器。
+
+**参考项目**：SaschaWillems/Vulkan-glTF-PBR（社区最佳范本，PBR+IBL+阴影+骨骼动画全覆盖）
 
 ### 0.7 AEC 简化策略
 
@@ -180,16 +203,18 @@ TTS 首音块:         150-400 ms
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  UI 层 (平台特定)                                        │
-│  - Windows: Win32 + GLES3.0 + WASAPI                   │
-│  - Android: NativeActivity + GLES3.0 + AAudio          │
-│  - Linux: CLI / TUI (无图形界面)                         │
+│  3D World 前端 (Windows, 纯 C++ + Vulkan + SDL3)         │
+│  - Vulkan PBR 渲染 (glTF 场景 + bbmodel/VRM 角色)       │
+│  - Box3D 物理 (MeshShape + Character mover)             │
+│  - SDL3 窗口/输入/音频                                   │
+│  - ImGui 调试面板                                        │
 ├─────────────────────────────────────────────────────────┤
 │  应用层 (C++ 跨平台)                                     │
 │  - ConversationManager (对话状态机)                     │
 │  - EmotionDriver (情感标签 → 动画映射)                  │
 │  - MemoryOrchestrator (短期/长期记忆协调)               │
 │  - PipelineScheduler (流式管线调度)                     │
+│  - VoicePipeline (VAD→ASR→LLM→TTS 同进程多线程)        │
 ├─────────────────────────────────────────────────────────┤
 │  核心服务层 (C++ 跨平台)                                 │
 │  ┌──────────┬──────────┬──────────┬──────────┐         │
@@ -238,10 +263,32 @@ winefox/
 │   │   ├── windows/
 │   │   ├── android/
 │   │   └── linux/
-│   ├── ui/                       # 渲染层（Windows / Android）
-│   │   ├── renderer/             # D3D11 / GLES3
-│   │   ├── bbmodel/              # BlockBench 模型加载与动画
-│   │   └── input/                # 交互
+│   ├── world/                    # 3D World 前端（Phase 4，替换原 ui/）
+│   │   ├── render/               # Vulkan 渲染层
+│   │   │   ├── vulkan_device.*   # 设备/交换链/VMA
+│   │   │   ├── renderer.*        # 主渲染管线
+│   │   │   ├── gltf_renderer.*   # glTF 场景渲染
+│   │   │   ├── ibl.*             # IBL 环境光预计算
+│   │   │   ├── shadow.*          # 阴影映射
+│   │   │   └── shaders/          # GLSL 着色器源码
+│   │   ├── scene/                # 场景管理
+│   │   │   ├── gltf_loader.*     # tinygltf 封装
+│   │   │   ├── camera.*          # 第一人称相机
+│   │   │   └── light.*           # 光源管理
+│   │   ├── physics/              # Box3D 物理
+│   │   │   ├── physics_world.*   # b3World 封装
+│   │   │   ├── collider_builder.*# glTF→三角网格碰撞
+│   │   │   └── player_controller.*# Character mover 封装
+│   │   ├── character/            # 角色渲染
+│   │   │   ├── bbmodel_*.*       # BlockBench 模型解析+渲染
+│   │   │   ├── vrm_loader.*      # VRM 加载（后续）
+│   │   │   └── animation_controller.* # 动画状态机
+│   │   ├── voice/                # 语音管线（复用 voice-test 组件）
+│   │   │   ├── audio_io.*        # SDL_audio 麦克风/扬声器
+│   │   │   ├── voice_pipeline.*  # VAD→ASR→LLM→TTS 管线
+│   │   │   └── segmenter.*       # VAD 段状态机
+│   │   └── input/                # 输入处理
+│   │       └── input_manager.*
 │   └── app/                      # 应用入口
 ├── third_party/
 │   ├── llama.cpp/                # git submodule (ggml + LLM)
@@ -250,6 +297,15 @@ winefox/
 │   ├── ten-vad/                  # prebuilt lib (VAD)
 │   ├── kokoro-cpp/               # vendored G2P frontend (TTS)
 │   ├── webrtc-apm/               # AEC3 提取模块
+│   ├── SDL3/                     # FetchContent (窗口/输入/音频)
+│   ├── box3d/                    # FetchContent (3D 物理)
+│   ├── VMA/                      # header-only (Vulkan 内存分配)
+│   ├── tinygltf/                 # header-only (glTF 加载)
+│   ├── meshoptimizer/            # header-only (几何优化)
+│   ├── glm/                      # header-only (数学库)
+│   ├── imgui/                    # submodule (调试 UI)
+│   ├── shaderc/                  # 预编译包 (GLSL→SPIR-V)
+│   ├── Vulkan-Headers/           # Vulkan API 头文件
 │   ├── sqlite/                   # sqlite3.c + sqlite3.h
 │   └── json/                     # nlohmann/json
 ├── models/                       # 已有
@@ -671,22 +727,59 @@ public:
 - 通过 llama.cpp 加载（与 LLM 共享 ggml 后端内存池）。
 - 批量接口减少 LLM 后端切换开销。
 
-### 3.6 UI 渲染层
+### 3.6 3D World 前端
 
-**职责**：渲染酒狐形象，根据情感驱动动画。
+**职责**：纯 C++ + Vulkan 渲染 3D 虚拟世界，用户以第一人称进入与酒狐互动。
 
-**bbmodel 渲染器**：
+**架构**：
 
-```cpp
-class BbModelRenderer {
-public:
-    bool load(const std::string& bbmodel_path);  // JSON 解析
-    void set_emotion(Emotion e);                 // 切换表情/动作集
-    void set_animation(const std::string& name); // 手动切动画
-    void update(float dt);                       // 骨骼动画 tick
-    void render(RenderContext* ctx);             // GLES3 (Windows / Android 统一)
-};
 ```
+┌───────────────────────────────────────────────────────┐
+│                  winefox-world (单进程)                 │
+├───────────────────────┬───────────────────────────────┤
+│   渲染线程 (主线程)    │      AI线程 (工作线程)          │
+│                       │                               │
+│  ┌─ Vulkan渲染层 ──┐  │  ┌─ 现有winefox核心 ────────┐  │
+│  │ device/swapchain │  │  │ LLM (llama.cpp)          │  │
+│  │ PBR forward管线  │  │  │ VAD→ASR→LLM→TTS 流水线    │  │
+│  │ IBL环境光照       │  │  │ 记忆系统 (SQLite+Embed)   │  │
+│  │ 阴影映射 (PCF)    │  │  │ EmotionDriver            │  │
+│  └──────────────────┘  │  └──────────────────────────┘  │
+│  ┌─ 场景层 ────────┐  │                               │
+│  │ glTF场景加载     │◄─┼──┘  线程安全消息队列：         │
+│  │ 相机控制器       │  │  AI→Render: emotion,文本      │
+│  └──────────────────┘  │  Render→AI: 用户输入          │
+│  ┌─ 物理层 ────────┐  │                               │
+│  │ Box3D            │  │                               │
+│  │ MeshShape碰撞    │  │                               │
+│  │ Character mover  │  │                               │
+│  └──────────────────┘  │                               │
+│  ┌─ 角色层 ────────┐  │                               │
+│  │ bbmodel渲染器    │  │                               │
+│  │ VRM加载 (后续)   │  │                               │
+│  └──────────────────┘  │                               │
+│  ┌─ 输入/UI ───────┐  │                               │
+│  │ SDL3键鼠处理     │  │                               │
+│  │ ImGui调试面板    │  │                               │
+│  └──────────────────┘  │                               │
+└───────────────────────┴───────────────────────────────┘
+```
+
+**渲染管线**（Forward PBR）：
+1. 阴影 Pass：方向光视角 → 2048² 深度图
+2. 主 Pass：glTF 场景 + bbmodel 角色，PBR Cook-Torrance + IBL + 阴影采样
+3. 透明 Pass：玻璃/水面（按距离排序）
+4. 后处理：Tone mapping (ACES) + Bloom
+5. UI Pass：ImGui 叠加
+
+**物理系统**：
+- Box3D MeshShape 吃 glTF 三角网格做静态碰撞（BVH 加速）
+- Character mover 做第一人称角色控制器（爬楼梯、碰撞滑动）
+- 射线检测用于交互（点击物体等）
+
+**角色系统**：
+- bbmodel：JSON 解析 → 骨骼树 + 立方体列表 → Vulkan mesh，骨骼动画驱动
+- VRM（后续）：复用 tinygltf 加载，解析 VRMC_vrm 扩展，MToon 着色器
 
 **情感 → 动画映射**：
 
@@ -699,32 +792,22 @@ public:
 | anger | 跺脚、炸毛 | 撅嘴 |
 | fear | 缩成一团 | 瞳孔收缩 |
 
-每个 emotion 对应 2-3 个动作变体，随机选取避免重复。
-
-**交互**：
-- 鼠标/触摸酒狐不同部位触发不同反应（摸头 → joy，摸尾巴 → anger）。
-- 长按酒狐 → 弹出菜单（设置、记忆查看等）。
-
 ---
 
 ## 4. 平台支持矩阵
 
 | 平台 | 架构 | GUI | 音频 IO | 备注 |
 |------|------|-----|---------|------|
-| Windows | x64 | ✅ GLES3 | WASAPI | 主开发平台 |
-| Windows | x86 | ✅ GLES3 | WASAPI | 兼容老设备 |
-| Windows | arm64 | ✅ GLES3 | WASAPI | Snapdragon X |
-| Android | arm64 | ✅ GLES3 | AAudio | API 26+ |
-| Linux | x64 | ❌ CLI | PulseAudio | TUI 对话 |
-| Linux | x86 | ❌ CLI | PulseAudio | 兼容老设备 |
-| Linux | arm64 | ❌ CLI | PulseAudio | 树莓派 4+ |
+| Windows | x64 | ✅ Vulkan + SDL3 | SDL_audio | 主开发平台 (3D World) |
+| Windows | x86 | ✅ Vulkan + SDL3 | SDL_audio | 兼容老设备 |
+| Windows | arm64 | ✅ Vulkan + SDL3 | SDL_audio | Snapdragon X |
+| Android | arm64 | ❌ (后续) | AAudio | 延后，3D World 暂不支持 Android |
+| Linux | x64 | ❌ CLI | SDL_audio | TUI 对话 + 语音 |
+| Linux | x86 | ❌ CLI | SDL_audio | 兼容老设备 |
+| Linux | arm64 | ❌ CLI | SDL_audio | 树莓派 4+ |
 | Linux | arm32 | ❌ CLI | ALSA | 极限兼容（树莓派 2/3） |
 
-**Linux 无 GUI 的设计**：
-- 编译宏 `WINEFOX_NO_GUI` 禁用 UI 模块。
-- CLI 模式：stdin/stdout 文本对话 + 可选 TTS 播放。
-- 适合服务器部署（如树莓派家庭服务器）。
-- arm32 设备默认禁用 TTS 实时合成（性能不足），仅文本对话；可选预生成音频文件方式。
+**3D World 仅限 Windows**：Vulkan + SDL3 渲染只在 Windows x64 上构建。Linux 保持 CLI 模式。Android 3D World 延后到远期。
 
 ---
 
@@ -835,17 +918,18 @@ public:
 - 估算播放延迟（启动时探测，~50-200ms），AEC 内部 delay compensation。
 - 提供「AEC 校准」向导：播放 sweep tone，测量环路延迟。
 
-### 6.5 bbmodel 渲染
+### 6.5 Vulkan 3D 渲染
 
-**难点**：bbmodel 是 BlockBench 格式（基岩版实体），非标准骨骼动画。
+**难点**：纯 Vulkan 渲染管线开发量大，glTF PBR + IBL + 阴影 + 骨骼动画需要大量着色器代码。
 
 **方案**：
-- bbmodel 本质是 JSON，含 cubes、bones、animations。
-- 实现 JSON 解析器 → 构建骨骼树。
-- 动画按关键帧插值（位置、旋转、缩放）。
-- 立方体渲染：统一用 GLES3 VBO + 简单 vertex/fragment shader，Windows 与 Android 共享同一套渲染代码。
-- 贴图：从 bbmodel 引用的 PNG 加载，UV 映射。
-- 已有素材：`WineFoxModel/模型文件/人物模型/大正女仆酒狐.bbmodel`（默认形象）。
+- 参考 **SaschaWillems/Vulkan-glTF-PBR** 的完整实现，逐模块学习
+- glTF 加载用 tinygltf（header-only），PBR 用 Cook-Torrance GGX
+- IBL 三件套：irradiance map + prefiltered env + BRDF LUT
+- 阴影：单方向光 + PCF 软阴影（起步），CSM（进阶）
+- bbmodel：JSON 解析 → 立方体 mesh → Vulkan buffer，骨骼动画在 vertex shader 中变换
+- 已有素材：`WineFoxModel/模型文件/人物模型/大正女仆酒狐.bbmodel`（默认形象）
+- **分阶段实现**：4A 先跑通语音对话（空窗口），4B 再加 Vulkan 渲染，4C 加物理+角色
 
 ### 6.6 跨平台音频 IO 抽象
 
@@ -919,19 +1003,85 @@ public:
 
 **验收**：扬声器模式无回声，P50 ≤ 1.5s，长时间运行稳定。
 
-### Phase 4：GUI 与酒狐形象（Windows）
+### Phase 4：3D World（Vulkan + SDL3 + Box3D）
 
-**目标**：图形界面 + 酒狐形象 + 情感驱动动画。
+**目标**：纯 C++ + Vulkan 3D 虚拟世界，用户走进世界与酒狐语音对话互动。
 
-- [ ] Win32 窗口 + GLES3 渲染上下文（含 ANGLE 兜底）
-- [ ] bbmodel 解析器
-- [ ] 骨骼动画系统
-- [ ] 表情切换（贴图 UV 切换或顶点形变）
-- [ ] EmotionDriver（LLM 输出解析 → 动画切换）
-- [ ] 用户交互（点击/拖拽酒狐）
-- [ ] 设置面板
+替换原 Phase 4（GLES3 + bbmodel 2D 渲染）。AI 核心（Phase 1-3）完全保留。
 
-**验收**：完整图形化体验，6 种情感对应动画，可交互。
+**技术栈**：Vulkan 1.3 + Vulkan-HPP + SDL3 + Box3D + tinygltf + VMA + meshoptimizer + glm + shaderc + ImGui
+
+#### Phase 4A：SDL3 窗口 + 语音对话（当前）
+
+**目标**：创建空 SDL3 窗口，链接现有 LLM + 语音后端，实现端到端语音对话。
+
+- [x] 项目骨架（src/world/ 目录结构 + CMake 构建）
+- [x] SDL3 窗口创建（空窗口，处理关闭事件）
+- [x] 链接 winefox_core（LLM + 记忆 + ConversationManager）
+- [x] 链接语音后端（ten-vad VAD + SenseVoice ASR + Kokoro TTS）
+- [x] SDL_audio 麦克风输入 + 扬声器输出
+- [x] VoicePipeline：VAD→ASR→LLM→TTS 端到端语音对话
+- [x] 同进程多线程（主线程窗口，工作线程 AI 管线）
+
+**验收**：打开窗口后可以语音对话，酒狐语音回复。
+
+#### Phase 4B：Vulkan 基础 + glTF 渲染
+
+**目标**：Vulkan 设备初始化、交换链、tinygltf 加载、基础 PBR 渲染。
+
+- [ ] Vulkan 设备 + 交换链 + VMA 集成
+- [ ] tinygltf 加载 glb 场景文件
+- [ ] PBR Cook-Torrance 着色器（metallic-roughness）
+- [ ] 基础方向光 + 环境光
+- [ ] meshoptimizer 顶点优化
+
+**验收**：窗口中显示一个 glTF 小屋场景。
+
+#### Phase 4C：物理 + 角色控制器 + bbmodel
+
+**目标**：Box3D 集成、第一人称控制器、bbmodel 角色渲染。
+
+- [ ] Box3D 集成（FetchContent）
+- [ ] glTF 三角网格 → MeshShape 碰撞
+- [ ] Character mover 第一人称控制器（WASD + 鼠标看向）
+- [ ] bbmodel 解析 + Vulkan 立方体渲染
+- [ ] 骨骼动画（idle 呼吸）
+- [ ] 酒狐出现在场景中
+
+**验收**：能在小屋中走动，酒狐站在场景中有 idle 动画。
+
+#### Phase 4D：光影增强
+
+**目标**：IBL 环境光照、阴影映射、后处理。
+
+- [ ] IBL（irradiance map + prefiltered env + BRDF LUT）
+- [ ] 阴影映射（单方向光 + PCF 软阴影）
+- [ ] Tone mapping (ACES) + Bloom
+- [ ] 雾效果
+
+**验收**：画面质量达到可接受水平。
+
+#### Phase 4E：AI 集成
+
+**目标**：语音对话驱动角色表情/动作响应。
+
+- [ ] EmotionDriver（LLM 输出 → emotion 标签 → 动画映射）
+- [ ] TTS 驱动口型同步
+- [ ] 动画状态机（idle ↔ talking ↔ emotion 反应）
+- [ ] ImGui 调试面板（显示对话文本、emotion、perf）
+
+**验收**：语音对话时酒狐表情/动作实时响应。
+
+#### Phase 4F：VRM 支持（可选）
+
+**目标**：VRM 精细角色替换 bbmodel。
+
+- [ ] VRM 加载（复用 tinygltf + VRMC_vrm 扩展解析）
+- [ ] MToon 卡通着色器
+- [ ] spring bone 物理（头发/衣服摆动）
+- [ ] 表情 morph targets
+
+**验收**：精细二次元角色替换 bbmodel，效果可接受。
 
 ### Phase 5：TTS 自训模型替换
 
@@ -947,13 +1097,11 @@ public:
 
 ### Phase 6：跨平台扩展
 
-**目标**：扩展到所有目标平台。
+**目标**：扩展到所有目标平台（3D World 仅限 Windows）。
 
-- [ ] Windows x86 / arm64
-- [ ] Linux x64 / x86 / arm64 / arm32（CLI 模式）
-- [ ] Android arm64
-- [ ] Android GUI（NativeActivity + GLES3）
-- [ ] Android 音频（AAudio）
+- [ ] Windows x86 / arm64（Vulkan + SDL3）
+- [ ] Linux x64 / x86 / arm64 / arm32（CLI 模式 + SDL_audio）
+- [ ] Android arm64（CLI 模式，3D World 延后）
 - [ ] CI/CD 多平台构建
 
 **验收**：所有目标平台可运行，性能达标。

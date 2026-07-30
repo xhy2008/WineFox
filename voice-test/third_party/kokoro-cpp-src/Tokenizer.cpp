@@ -3,10 +3,18 @@
 #include "ZHG2P.h"
 #include <iostream>
 #include <vector>
+#include <chrono>
+#include <cstdio>
 
 Tokenizer::Tokenizer(const TokenizerConfig& config, const std::map<std::string, int>& vocab) 
     : vocab_(vocab) {
     
+    auto t0 = std::chrono::steady_clock::now();
+    auto ms_since = [&]() {
+        return std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+    };
+
     std::string d = config.dict_dir;
     if (!d.empty() && d.back() != '/') d += "/";
     
@@ -23,7 +31,9 @@ Tokenizer::Tokenizer(const TokenizerConfig& config, const std::map<std::string, 
         processor_ = std::make_shared<JiebaProcessor>(
             jieba_dict, hmm_model, user_dict, idf_path, stop_word_path, pinyin_char, pinyin_phrase
         );
+        std::fprintf(stderr, "[tokenizer] JiebaProcessor: %.0f ms\n", ms_since());
         g2p_ = std::make_unique<ZHG2P>(processor_, "1.1", "<unk>", cmu_dict);
+        std::fprintf(stderr, "[tokenizer] ZHG2P: %.0f ms\n", ms_since());
     } catch (const std::exception& e) {
         std::cerr << "Failed to initialize Tokenizer dependencies: " << e.what() << std::endl;
     }

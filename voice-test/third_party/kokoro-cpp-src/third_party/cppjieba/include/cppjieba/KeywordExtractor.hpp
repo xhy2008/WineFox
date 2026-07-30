@@ -91,28 +91,36 @@ class KeywordExtractor {
   }
  private:
   void LoadIdfDict(const std::string& idfPath) {
-    std::ifstream ifs(idfPath.c_str());
+    // Fast path: read entire file, parse in-place (avoid per-line vector alloc).
+    std::ifstream ifs(idfPath, std::ios::binary | std::ios::ate);
     XCHECK(ifs.is_open()) << "open " << idfPath << " failed";
-    std::string line ;
-    std::vector<std::string> buf;
-    double idf = 0.0;
+    auto sz = ifs.tellg();
+    ifs.seekg(0, std::ios::beg);
+    std::string content(sz, '\0');
+    ifs.read(&content[0], sz);
+
+    idfMap_.reserve(200000);
     double idfSum = 0.0;
     size_t lineno = 0;
-    for (; getline(ifs, line); lineno++) {
-      buf.clear();
-      if (line.empty()) {
-        XLOG(ERROR) << "lineno: " << lineno << " empty. skipped.";
-        continue;
-      }
-      limonp::Split(line, buf, " ");
-      if (buf.size() != 2) {
-        XLOG(ERROR) << "line: " << line << ", lineno: " << lineno << " empty. skipped.";
-        continue;
-      }
-      idf = atof(buf[1].c_str());
-      idfMap_[buf[0]] = idf;
-      idfSum += idf;
+    size_t pos = 0;
+    while (pos < content.size()) {
+      size_t line_end = content.find('\n', pos);
+      if (line_end == std::string::npos) line_end = content.size();
+      size_t line_len = line_end - pos;
+      if (line_len > 0 && content[pos + line_len - 1] == '\r') line_len--;
+      if (line_len == 0) { pos = line_end + 1; lineno++; continue; }
 
+      const char* base = content.data() + pos;
+      const char* sp = (const char*)memchr(base, ' ', line_len);
+      if (!sp) { pos = line_end + 1; lineno++; continue; }
+
+      std::string word(base, sp - base);
+      std::string idf_str(sp + 1, base + line_len - sp - 1);
+      double idf = atof(idf_str.c_str());
+      idfMap_[word] = idf;
+      idfSum += idf;
+      lineno++;
+      pos = line_end + 1;
     }
 
     assert(lineno);

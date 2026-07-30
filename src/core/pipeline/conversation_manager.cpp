@@ -255,6 +255,7 @@ std::string ConversationManager::chat(const std::string& user_input,
     if (!emotion_parsed) {
         emotion = "neutral";
     }
+    last_emotion_ = emotion;
 
     auto perf = llm_->last_perf();
     WF_LOG_INFO("ConvMgr: %d tokens, %.1f tok/s, prefill %.0f ms, emotion=[%s]",

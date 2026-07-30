@@ -1,11 +1,13 @@
 #include "Kokoro.h"
 #include "Tokenizer.h"
+#include <cstdio>
 #include <fstream>
 #include <sstream>
 #include <regex>
 #include <numeric>
 #include <cstring>
 #include <chrono>
+#include <future>
 #include <thread>
 
 namespace {
@@ -69,11 +71,6 @@ Ort::Session open_session(Ort::Env& env, const std::string& path,
 
 }  // namespace
 
-// Helper to trim audio (simple amplitude based silence removal)
-std::vector<float> trim_audio(const std::vector<float>& audio, int sample_rate, float threshold_db = 60.0f) {
-    return audio;
-}
-
 // Static input/output names for ORT sessions. Defined once here so each
 // _create_audio_split call does not reconstruct char* arrays on the stack.
 const char* Kokoro::kEncInputNames[3]  = {"input_ids", "ref_s", "speed"};
@@ -93,53 +90,64 @@ Kokoro::Kokoro(const std::string& encoder_path,
     , split_mode_(true)
     , n_threads_(resolve_threads(n_threads))
 {
-    // Encoder: BERT + LSTM, precision-sensitive, FP32.
-    // Use fewer threads (BERT parallelism is limited); cap at 4.
+    auto t0 = std::chrono::steady_clock::now();
+    auto ms_since = [&]() {
+        return std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+    };
+
+    // Load ONNX sessions and vocab+tokenizer in parallel.
+    // The tokenizer (JiebaProcessor + EnG2P) loads ~24MB of dictionary
+    // files and builds a Trie — CPU-bound but independent of ONNX.
+    // Voices index is fast and done inline after sessions.
     int enc_threads = std::min(n_threads_, 4);
-    auto enc_so = make_session_options(enc_threads);
-    enc_session_ = open_session(env_, encoder_path, enc_so);
 
-    // Decoder: conv-heavy, parallelizes well, INT8 quantized.
-    // Use full thread budget.
-    auto dec_so = make_session_options(n_threads_);
-    dec_session_ = open_session(env_, decoder_path, dec_so);
-
-    load_voices(voices_path);
-
-    // Load vocab + tokenizer (shared init)
-    std::map<std::string, int> vocab;
-    std::ifstream in(vocab_path);
-    if (in.is_open()) {
-        std::string line;
-        while (std::getline(in, line)) {
-            size_t tab = line.find('\t');
-            if (tab != std::string::npos) {
-                std::string token = line.substr(0, tab);
-                std::string id_str = line.substr(tab + 1);
-                size_t pos = 0;
-                while((pos = token.find("\\n", pos)) != std::string::npos) { token.replace(pos, 2, "\n"); pos += 1; }
-                pos = 0;
-                while((pos = token.find("\\r", pos)) != std::string::npos) { token.replace(pos, 2, "\r"); pos += 1; }
-                pos = 0;
-                while((pos = token.find("\\t", pos)) != std::string::npos) { token.replace(pos, 2, "\t"); pos += 1; }
-                try { vocab[token] = std::stoi(id_str); } catch (...) {}
+    // Thread A: vocab parse + tokenizer init (slow — jieba + CMU dict + Trie)
+    auto tokenizer_future = std::async(std::launch::async, [&]() {
+        std::map<std::string, int> vocab;
+        std::ifstream in(vocab_path);
+        if (in.is_open()) {
+            std::string line;
+            while (std::getline(in, line)) {
+                size_t tab = line.find('\t');
+                if (tab != std::string::npos) {
+                    std::string token = line.substr(0, tab);
+                    std::string id_str = line.substr(tab + 1);
+                    size_t pos = 0;
+                    while((pos = token.find("\\n", pos)) != std::string::npos) { token.replace(pos, 2, "\n"); pos += 1; }
+                    pos = 0;
+                    while((pos = token.find("\\r", pos)) != std::string::npos) { token.replace(pos, 2, "\r"); pos += 1; }
+                    pos = 0;
+                    while((pos = token.find("\\t", pos)) != std::string::npos) { token.replace(pos, 2, "\t"); pos += 1; }
+                    try { vocab[token] = std::stoi(id_str); } catch (...) {}
+                }
             }
         }
-        std::cout << "Loaded " << vocab.size() << " tokens from " << vocab_path << std::endl;
-    } else {
-        std::cerr << "Warning: Failed to open vocab file: " << vocab_path << std::endl;
-    }
-    tokenizer_ = std::make_unique<Tokenizer>(TokenizerConfig{}, vocab);
+        tokenizer_ = std::make_unique<Tokenizer>(TokenizerConfig{}, vocab);
+    });
 
-    std::cout << "Kokoro split mode: enc_threads=" << enc_threads
-              << " dec_threads=" << n_threads_ << std::endl;
+    // Main thread: ONNX sessions (sequential — both use env_)
+    {
+        auto enc_so = make_session_options(enc_threads);
+        enc_session_ = open_session(env_, encoder_path, enc_so);
+        auto dec_so = make_session_options(n_threads_);
+        dec_session_ = open_session(env_, decoder_path, dec_so);
+    }
+    std::fprintf(stderr, "[kokoro] ONNX sessions loaded: %.0f ms\n", ms_since());
+
+    // Voices index (fast file scan — ~0.1ms for 54 voices)
+    load_voices(voices_path);
+    std::fprintf(stderr, "[kokoro] voices loaded: %.0f ms\n", ms_since());
+
+    // Wait for tokenizer to finish.
+    tokenizer_future.get();
+    std::fprintf(stderr, "[kokoro] tokenizer loaded: %.0f ms\n", ms_since());
 
     // Warmup: run a short dummy forward through encoder + decoder so that
     // ORT compiles the execution plan, primes the memory arena, and JITs
-    // any shape-specific kernels before the first user-facing call. The
-    // first run is typically 2-3x slower than subsequent runs on the same
-    // shape due to plan compilation; this hides that latency at load time.
+    // any shape-specific kernels before the first user-facing call.
     warmup_split();
+    std::fprintf(stderr, "[kokoro] warmup done: %.0f ms\n", ms_since());
 }
 
 // ---------------------------------------------------------------------------
@@ -175,7 +183,6 @@ Kokoro::Kokoro(const std::string& model_path, const std::string& voices_path, co
                 try { vocab[token] = std::stoi(id_str); } catch (...) {}
             }
         }
-        std::cout << "Loaded " << vocab.size() << " tokens from " << vocab_path << std::endl;
     } else {
         std::cerr << "Warning: Failed to open vocab file: " << vocab_path << std::endl;
     }
@@ -233,9 +240,6 @@ void Kokoro::load_voices(const std::string& voices_path) {
         // Skip over the style data (dim * sizeof(float) bytes).
         in.seekg(static_cast<std::streamoff>(dim) * sizeof(float), std::ios::cur);
     }
-
-    std::cout << "Indexed " << voice_index_.size() << " voices from " << voices_path
-              << " (lazy loading, " << (voice_index_.empty() ? 0 : 1) << " cached)" << std::endl;
 }
 
 void Kokoro::preload_voices(const std::vector<std::string>& names) {
@@ -387,7 +391,6 @@ void Kokoro::warmup_split() {
             Ort::RunOptions{nullptr},
             kDecInputNames, dec_inputs.data(), dec_inputs.size(),
             kDecOutputNames, 1);
-        std::cerr << "[warmup] OK" << std::endl;
     } catch (const Ort::Exception& e) {
         std::cerr << "[warmup] failed (non-fatal): " << e.what() << std::endl;
     }
@@ -406,9 +409,6 @@ std::pair<std::vector<float>, int> Kokoro::_create_audio_split(
     const std::vector<float>& voice,
     float speed
 ) {
-    namespace chr = std::chrono;
-    auto t0 = chr::steady_clock::now();
-
     std::string truncated_phonemes = phonemes;
     if (phonemes.length() > MAX_PHONEME_LENGTH) {
         truncated_phonemes = phonemes.substr(0, MAX_PHONEME_LENGTH);
@@ -457,7 +457,6 @@ std::pair<std::vector<float>, int> Kokoro::_create_audio_split(
         mem_info_, speed_buf_.data(), speed_buf_.size(),
         speed_shape_.data(), speed_shape_.size()));
 
-    auto t_enc_start = chr::steady_clock::now();
     auto enc_outputs = enc_session_.Run(
         Ort::RunOptions{nullptr},
         kEncInputNames,
@@ -466,7 +465,6 @@ std::pair<std::vector<float>, int> Kokoro::_create_audio_split(
         kEncOutputNames,
         5
     );
-    auto t_enc_end = chr::steady_clock::now();
 
     // Encoder outputs become decoder inputs (zero-copy: ORT holds the buffers).
     // asr:       [1, 512, T_frm]      float32
@@ -480,7 +478,6 @@ std::pair<std::vector<float>, int> Kokoro::_create_audio_split(
     dec_inputs.push_back(std::move(enc_outputs[2]));  // N_pred
     dec_inputs.push_back(std::move(enc_outputs[3]));  // style_dec
 
-    auto t_dec_start = chr::steady_clock::now();
     auto dec_outputs = dec_session_.Run(
         Ort::RunOptions{nullptr},
         kDecInputNames,
@@ -489,21 +486,11 @@ std::pair<std::vector<float>, int> Kokoro::_create_audio_split(
         kDecOutputNames,
         1
     );
-    auto t_dec_end = chr::steady_clock::now();
 
     float* floatarr = dec_outputs[0].GetTensorMutableData<float>();
     size_t output_len = dec_outputs[0].GetTensorTypeAndShapeInfo().GetElementCount();
 
     std::vector<float> audio(floatarr, floatarr + output_len);
-
-    auto ms = [](chr::steady_clock::time_point a, chr::steady_clock::time_point b) {
-        return chr::duration<double, std::milli>(b - a).count();
-    };
-    std::fprintf(stderr,
-        "[perf] tokens=%zu audio=%zuSR=%.2fs pre=%6.1fms enc=%6.1fms dec=%6.1fms total=%6.1fms\n",
-        tokens_buf_.size(), output_len, output_len / (double)SAMPLE_RATE,
-        ms(t0, t_enc_start), ms(t_enc_start, t_enc_end),
-        ms(t_dec_start, t_dec_end), ms(t0, t_dec_end));
 
     return {audio, SAMPLE_RATE};
 }
@@ -619,13 +606,11 @@ std::pair<std::vector<float>, int> Kokoro::create(
     }
 
     auto batched_phonemes = _split_phonemes(phonemes);
+
     std::vector<float> full_audio;
 
     for (const auto& batch : batched_phonemes) {
         auto [audio_part, sr] = _create_audio(batch, voice_style, speed);
-        if (trim) {
-            audio_part = trim_audio(audio_part, sr);
-        }
         full_audio.insert(full_audio.end(), audio_part.begin(), audio_part.end());
     }
 
@@ -660,6 +645,7 @@ void Kokoro::create_stream(
     }
 
     auto batched_phonemes = _split_phonemes(phonemes);
+
     for (const auto& batch : batched_phonemes) {
         auto [audio_part, sr] = _create_audio(batch, voice_style, speed);
         if (!on_audio_chunk(audio_part, sr)) {

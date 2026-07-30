@@ -70,6 +70,9 @@ public:
 
     long long session_id() const { return session_id_; }
 
+    // Emotion tag parsed from the last chat() reply.
+    const std::string& last_emotion() const { return last_emotion_; }
+
 private:
     // Build just the system message (persona + profile). Used by both
     // build_messages_ and the init() warmup to avoid code duplication.
@@ -86,6 +89,7 @@ private:
 
     Config   cfg_;
     long long session_id_ = -1;
+    std::string last_emotion_ = "neutral";
 };
 
 } // namespace pipeline

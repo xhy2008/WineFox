@@ -46,47 +46,69 @@ private:
     std::unordered_map<std::string, std::string> arpabet_map_;
 
     void load_dict(const std::string& path) {
-        std::ifstream file(path);
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
         if (!file.is_open()) {
-            // Silent fail or log?
             std::cerr << "[EnG2P] Warning: Failed to open CMU dict: " << path << std::endl;
             return;
         }
+        auto sz = file.tellg();
+        file.seekg(0, std::ios::beg);
+        std::string content(sz, '\0');
+        file.read(&content[0], sz);
+
+        dict_.reserve(200000);
         std::string line;
         int count = 0;
-        while (std::getline(file, line)) {
-            if (line.empty()) continue;
-            // CMU dict lines start with word, possibly with symbols like !EXCLAMATION-POINT
-            // Standard format: WORD  PH ON E M ES
-            if (!isalpha(line[0]) && line[0] != '\'') continue; // Basic filtering
+        size_t pos = 0;
+        while (pos < content.size()) {
+            size_t line_end = content.find('\n', pos);
+            if (line_end == std::string::npos) line_end = content.size();
+            size_t line_len = line_end - pos;
+            if (line_len > 0 && content[pos + line_len - 1] == '\r') line_len--;
+            if (line_len == 0) { pos = line_end + 1; continue; }
 
-            std::stringstream ss(line);
-            std::string word, ph;
-            ss >> word;
-            
+            if (!isalpha((unsigned char)content[pos]) && content[pos] != '\'') {
+                pos = line_end + 1;
+                continue;
+            }
+
+            // Find first space (separates word from phonemes)
+            size_t sp1 = content.find(' ', pos);
+            if (sp1 == std::string::npos || sp1 >= line_end) { pos = line_end + 1; continue; }
+            std::string word(content.data() + pos, sp1 - pos);
+
+            // Skip additional spaces between word and phonemes
+            size_t ph_start = sp1 + 1;
+            while (ph_start < line_end && content[ph_start] == ' ') ph_start++;
+
+            // Parse phonemes (space-separated) in one pass
+            std::vector<std::string> phonemes;
+            size_t ph_pos = ph_start;
+            while (ph_pos < line_end) {
+                size_t sp = content.find(' ', ph_pos);
+                if (sp == std::string::npos || sp >= line_end) {
+                    phonemes.emplace_back(content.data() + ph_pos, line_end - ph_pos);
+                    break;
+                }
+                phonemes.emplace_back(content.data() + ph_pos, sp - ph_pos);
+                ph_pos = sp + 1;
+            }
+
             // Handle variants like WORD(1)
             size_t paren = word.find('(');
             if (paren != std::string::npos) {
                 word = word.substr(0, paren);
             }
 
-            // Normalize to UPPERCASE
             std::transform(word.begin(), word.end(), word.begin(), ::toupper);
 
-            std::vector<std::string> phonemes;
-            while (ss >> ph) {
-                phonemes.push_back(ph);
-            }
-            
-            // Only keep first variant if multiple exist (CMU dict is sorted, usually main first)
             if (!dict_.count(word)) {
-                dict_[word] = phonemes;
+                dict_[word] = std::move(phonemes);
                 count++;
-                // if (count < 5) std::cout << "Debug CMU: Loaded [" << word << "]" << std::endl;
             }
+            pos = line_end + 1;
         }
-        std::cout << "[EnG2P] Loaded " << dict_.size() << " words from CMU dict." << std::endl;
-        
+        std::cerr << "[EnG2P] Loaded " << dict_.size() << " words from CMU dict." << std::endl;
     }
 
     void init_arpabet_map() {

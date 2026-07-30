@@ -6,6 +6,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
+#include <cstdio>
+#include <chrono>
 #include <deque>
 #include <set>
 #include <string>
@@ -164,7 +166,9 @@ class DictTrie {
 
  private:
   void Init(const std::string& dict_path, const std::string& user_dict_paths, UserWordWeightOption user_word_weight_opt) {
+    auto t0 = std::chrono::steady_clock::now();
     LoadDict(dict_path);
+    auto t1 = std::chrono::steady_clock::now();
     freq_sum_ = CalcFreqSum(static_node_infos_);
     CalculateWeight(static_node_infos_, freq_sum_);
     SetStaticWordWeights(user_word_weight_opt);
@@ -173,7 +177,14 @@ class DictTrie {
       LoadUserDict(user_dict_paths);
     }
     Shrink(static_node_infos_);
+    auto t2 = std::chrono::steady_clock::now();
     CreateTrie(static_node_infos_);
+    auto t3 = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "[DictTrie] LoadDict: %.0f ms, pre-trie: %.0f ms, CreateTrie: %.0f ms (nodes=%zu)\n",
+      std::chrono::duration<double, std::milli>(t1 - t0).count(),
+      std::chrono::duration<double, std::milli>(t2 - t1).count(),
+      std::chrono::duration<double, std::milli>(t3 - t2).count(),
+      static_node_infos_.size());
   }
 
   void CreateTrie(const std::vector<DictUnit>& dictUnits) {
@@ -202,20 +213,45 @@ class DictTrie {
   }
 
   void LoadDict(const std::string& filePath) {
-    std::ifstream ifs(filePath.c_str());
+    // Fast path: read entire file into a buffer, then parse in-place.
+    // The original getline+limonp::Split approach allocated a temporary
+    // vector<string> per line (350k lines) — extremely slow on Windows.
+    std::ifstream ifs(filePath.c_str(), std::ios::binary | std::ios::ate);
     XCHECK(ifs.is_open()) << "open " << filePath << " failed.";
-    std::string line;
-    std::vector<std::string> buf;
+    auto sz = ifs.tellg();
+    ifs.seekg(0, std::ios::beg);
+    std::string content(sz, '\0');
+    ifs.read(&content[0], sz);
+
+    // Pre-reserve: jieba.dict.utf8 has ~350k entries. Over-reserve slightly
+    // to avoid reallocations during push_back.
+    static_node_infos_.reserve(400000);
 
     DictUnit node_info;
-    while (getline(ifs, line)) {
-      limonp::Split(line, buf, " ");
-      XCHECK(buf.size() == DICT_COLUMN_NUM) << "split result illegal, line:" << line;
-      MakeNodeInfo(node_info,
-            buf[0],
-            atof(buf[1].c_str()),
-            buf[2]);
+    size_t pos = 0;
+    while (pos < content.size()) {
+      // Find end of line
+      size_t line_end = content.find('\n', pos);
+      if (line_end == std::string::npos) line_end = content.size();
+      size_t line_len = line_end - pos;
+      // Strip trailing \r
+      if (line_len > 0 && content[pos + line_len - 1] == '\r') line_len--;
+      if (line_len == 0) { pos = line_end + 1; continue; }
+
+      // Parse "word freq tag" — find two spaces manually (no vector alloc)
+      size_t sp1 = content.find(' ', pos);
+      if (sp1 == std::string::npos || sp1 >= line_end) { pos = line_end + 1; continue; }
+      size_t sp2 = content.find(' ', sp1 + 1);
+      if (sp2 == std::string::npos || sp2 >= line_end) { pos = line_end + 1; continue; }
+
+      std::string word(content.data() + pos, sp1 - pos);
+      std::string freq_str(content.data() + sp1 + 1, sp2 - sp1 - 1);
+      std::string tag(content.data() + sp2 + 1, line_end - sp2 - 1);
+
+      MakeNodeInfo(node_info, word, atof(freq_str.c_str()), tag);
       static_node_infos_.push_back(node_info);
+
+      pos = line_end + 1;
     }
   }
 
@@ -225,11 +261,18 @@ class DictTrie {
 
   void SetStaticWordWeights(UserWordWeightOption option) {
     XCHECK(!static_node_infos_.empty());
-    std::vector<DictUnit> x = static_node_infos_;
-    std::sort(x.begin(), x.end(), WeightCompare);
-    min_weight_ = x[0].weight;
-    max_weight_ = x[x.size() - 1].weight;
-    median_weight_ = x[x.size() / 2].weight;
+    // Optimization: we only need min, max, and median. Avoid copying the
+    // entire DictUnit vector (which contains Unicode LocalVectors — expensive
+    // to copy). Instead, build a lightweight weight-only vector and sort that.
+    std::vector<double> weights;
+    weights.reserve(static_node_infos_.size());
+    for (const auto& unit : static_node_infos_) {
+      weights.push_back(unit.weight);
+    }
+    std::sort(weights.begin(), weights.end());
+    min_weight_ = weights[0];
+    max_weight_ = weights[weights.size() - 1];
+    median_weight_ = weights[weights.size() / 2];
     switch (option) {
      case WordWeightMin:
        user_word_default_weight_ = min_weight_;

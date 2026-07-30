@@ -1,2 +1,0 @@
-﻿[PERF] LlmService: VISION INCREMENTAL prefill 2263 ms (1 images, before=136 after=9 n_past=153 cached_toks=175 cached_k
-v=183), 29 tokens in 1908 ms (15.2 tok/s)
