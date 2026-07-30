@@ -30,9 +30,6 @@ CMakeUserPresets.json
 /llama-b10017-bin-win-cpu-x64/
 /llama-b10017-bin-win-vulkan-x64/
 
-# Third-party sources cloned directly (not git submodules; re-clone to populate)
-/third_party/SDL3/
-
 # ---------------------------------------------------------------------------
 # voice-test sandbox
 # ---------------------------------------------------------------------------

@@ -2,3 +2,7 @@
 	path = third_party/llama.cpp
 	url = https://github.com/ggml-org/llama.cpp.git
 	branch = master
+[submodule "third_party/SDL3"]
+	path = third_party/SDL3
+	url = https://github.com/libsdl-org/SDL.git
+	branch = release-3.2.10
