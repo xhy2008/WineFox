@@ -95,7 +95,7 @@ private:
     InputCallback   on_input_;
     FarEndCallback  on_far_end_;
 
-    // Resampling buffer for AEC far-end reference (24kHz → 16kHz).
+    // Scratch buffer for the input audio callback (up to 100ms of 16kHz audio).
     std::vector<int16_t> in_buf_;
 
     // SDL audio callback for input only (output uses push model).

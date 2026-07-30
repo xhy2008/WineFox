@@ -27,7 +27,7 @@ static inline std::vector<int16_t> float_to_int16(const std::vector<float>& f) {
     return out;
 }
 
-TtsService::TtsService() : kokoro_(nullptr) {}
+TtsService::TtsService() = default;
 
 TtsService::~TtsService() {
     if (kokoro_) {
@@ -83,28 +83,6 @@ void TtsService::synth_stream(const std::string& text, float speed,
             return on_audio(pcm.data(), static_cast<int>(pcm.size()));
         },
         speed);
-}
-
-std::vector<int16_t> TtsService::synth(const std::string& text, float speed,
-                                       const std::string& voice_name) {
-    if (!kokoro_) {
-        return {};
-    }
-
-    auto* k = static_cast<Kokoro*>(kokoro_);
-
-    std::pair<std::vector<float>, int> result;
-    try {
-        result = k->create(text, voice_name, speed);
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "TtsService::synth failed: %s\n", e.what());
-        return {};
-    } catch (...) {
-        std::fprintf(stderr, "TtsService::synth failed: unknown exception\n");
-        return {};
-    }
-
-    return float_to_int16(result.first);
 }
 
 } // namespace world

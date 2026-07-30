@@ -61,11 +61,6 @@ public:
     VoicePipeline();
     ~VoicePipeline();
 
-    // Initialize all voice services and the AI core. Returns false on failure.
-    bool init(const WorldConfig& cfg,
-              WineFoxCore* core,
-              ipc::SpscQueue<ipc::RenderEvent, 256>* render_events);
-
     // --- Async init (for fast startup) ---
     // Step 1: Load voice models (TTS, VAD, ASR, AEC). Does NOT require core.
     //         Can run in parallel with winefox_init on another thread.
@@ -106,7 +101,7 @@ private:
     void set_state_(PipelineState s);
     void emit_subtitle_(const std::string& text);
     void emit_emotion_(const std::string& tag);
-    void emit_perf_(int n_eval, double tps, double prefill_ms);
+    void emit_perf_(int n_eval, double tps);
 
     // Push TTS audio to the output ring buffer (called from AI thread).
     void enqueue_tts_audio_(const int16_t* samples, int n);

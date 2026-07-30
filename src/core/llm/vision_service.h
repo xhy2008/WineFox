@@ -19,7 +19,6 @@
 
 #include "../memory/message.h"
 
-#include <functional>
 #include <llama.h>
 #include <mtmd.h>
 #include <mtmd-helper.h>
@@ -46,7 +45,6 @@ public:
     void close();
 
     bool ready()           const { return ctx_ != nullptr; }
-    bool supports_vision() const;
 
     // Media marker used in prompt text to indicate where the image should be
     // spliced (default "<__media__>"). The prompt must contain exactly
@@ -77,14 +75,12 @@ public:
                      bool logits_last,
                      llama_pos* new_n_past);
 
-    mtmd_context* ctx() { return ctx_.get(); }
     bool use_mrope() const;
 
     ~VisionService() { close(); }
 
 private:
     mtmd::context_ptr ctx_;
-    llama_flash_attn_type flash_attn_ = LLAMA_FLASH_ATTN_TYPE_DISABLED;
 };
 
 } // namespace llm

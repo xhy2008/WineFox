@@ -4,6 +4,7 @@
 #include "../util/time.h"
 
 #include <mtmd.h>
+#include <mtmd-helper.h>
 
 namespace winefox {
 namespace llm {
@@ -34,8 +35,6 @@ bool VisionService::load(const std::string& mmproj_path,
         ? LLAMA_FLASH_ATTN_TYPE_ENABLED
         : LLAMA_FLASH_ATTN_TYPE_DISABLED;
 
-    flash_attn_ = mparams.flash_attn_type;
-
     mtmd_context* raw = mtmd_init_from_file(mmproj_path.c_str(), text_model, mparams);
     if (!raw) {
         WF_LOG_ERROR("VisionService: mtmd_init_from_file failed: %s", mmproj_path.c_str());
@@ -53,7 +52,7 @@ bool VisionService::load(const std::string& mmproj_path,
 
     WF_LOG_INFO("VisionService: loaded %s (vision=%s, mrope=%s, non_causal=%s, marker=%s)",
                 mmproj_path.c_str(),
-                mtmd_support_vision(ctx_.get()) ? "on" : "off",
+                vision_ok ? "on" : "off",
                 mtmd_decode_use_mrope(ctx_.get()) ? "on" : "off",
                 mtmd_decode_use_non_causal(ctx_.get(), nullptr) ? "on" : "off",
                 mtmd_get_marker(ctx_.get()));
@@ -73,12 +72,8 @@ bool VisionService::use_mrope() const {
 }
 
 // ---------------------------------------------------------------------------
-// supports_vision / media_marker
+// media_marker
 // ---------------------------------------------------------------------------
-
-bool VisionService::supports_vision() const {
-    return ctx_ && mtmd_support_vision(ctx_.get());
-}
 
 const char* VisionService::media_marker() const {
     return ctx_ ? mtmd_get_marker(ctx_.get()) : mtmd_default_marker();

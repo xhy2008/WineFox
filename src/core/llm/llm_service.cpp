@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <cstring>
 
 #include <mtmd-helper.h>
 
@@ -24,13 +23,6 @@ namespace llm {
 // debugging, so we suppress them everywhere.
 static void silent_log_cb(ggml_log_level level, const char* text, void* /*user_data*/) {
     if (level >= GGML_LOG_LEVEL_ERROR) {
-        std::fputs(text, stderr);
-    }
-}
-
-// Debug callback: allow INFO-level logs from mtmd to locate vision perf issues.
-static void debug_log_cb(ggml_log_level level, const char* text, void* /*user_data*/) {
-    if (level >= GGML_LOG_LEVEL_INFO) {
         std::fputs(text, stderr);
     }
 }
@@ -202,7 +194,6 @@ bool LlmService::attach_lora(const std::string& lora_path, float scale) {
     }
 
     lora_attached_ = true;
-    lora_scale_    = scale;
 
     auto t1 = winefox::time::now_us();
     last_perf_.lora_attach_ms = (t1 - t0) / 1000.0;
@@ -824,7 +815,7 @@ void LlmService::chat_stream_with_images_(const std::vector<memory::Message>& me
         return;
     }
 
-    // Debug: log chunk count and types
+    // Log chunk count and types for vision perf telemetry
     {
         size_t n_chunks = mtmd_input_chunks_size(chunks);
         std::string chunk_info = "chunks=" + std::to_string(n_chunks);

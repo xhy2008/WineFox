@@ -1,16 +1,16 @@
-// aec_service.h — Acoustic Echo Cancellation (WebRTC AEC3).
+// aec_service.h — Acoustic Echo Cancellation (NLMS adaptive filter).
 //
-// Wraps WebRTC's AEC3 to remove the TTS output (far-end reference) from
-// the microphone capture, preventing the fox from hearing itself.
+// Removes the TTS output (far-end reference) from the microphone capture,
+// preventing the fox from hearing itself.
 //
 // Pipeline:
 //   mic (16kHz) + far-end ref (24kHz TTS → resampled to 16kHz)
-//     → AEC3 → cleaned mic → VAD/ASR
+//     → NLMS → cleaned mic → VAD/ASR
 //
 // The far-end reference is the same audio being sent to the speaker.
 // When TTS is not playing, pass silence as the far-end reference.
 //
-// Note: AEC3 is most effective with speaker output. When using headphones,
+// Note: AEC is most effective with speaker output. When using headphones,
 // set aec.enabled=false in config to bypass AEC entirely (no echo to cancel).
 
 #pragma once
@@ -45,11 +45,11 @@ public:
     bool enabled() const { return enabled_; }
 
 private:
-    void* handle_  = nullptr;  // webrtc::EchoCanceller3*
+    void* handle_  = nullptr;  // NlmsState*
     bool  enabled_ = false;
     int   level_   = 1;
 
-    // Internal float buffers (AEC3 works in float internally).
+    // Internal float buffers (NLMS works in float internally).
     std::vector<float> near_f_;
     std::vector<float> far_f_;
     std::vector<float> out_f_;

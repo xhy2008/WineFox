@@ -2,7 +2,6 @@
 
 #include "../log/log.h"
 
-#include <algorithm>
 #include <cmath>
 
 namespace winefox {

@@ -32,8 +32,8 @@ namespace winefox {
 namespace llm {
 
 // Initialise the llama.cpp backend. Must be called once before any LlmService
-// or EmbedderService. In Release builds, suppresses all llama.cpp/ggml log
-// output. In Debug builds, logs go to stderr (default behaviour).
+// or EmbedderService. Suppresses verbose llama.cpp/ggml INFO-level logs in
+// both Debug and Release builds (see silent_log_cb in llm_service.cpp).
 void init_backend();
 
 // Shut down the backend. Call once at program exit.
@@ -90,7 +90,6 @@ public:
     // called after load_base. Returns false if mmproj is invalid or does
     // not support vision.
     bool load_vision(const std::string& mmproj_path, const VisionOptions& vopts = {});
-    bool vision_ready() const { return vision_.ready(); }
 
     // Stream a chat completion. `on_token` returns false to stop early.
     // If `out_gen_tokens` is non-null, it receives the model-generated token
@@ -195,7 +194,6 @@ private:
     const llama_vocab*   vocab_  = nullptr;
     llama_adapter_lora*  lora_   = nullptr;
     bool                 lora_attached_ = false;
-    float                lora_scale_ = 1.0f;
 
     common_chat_templates_ptr chat_templates_;
 

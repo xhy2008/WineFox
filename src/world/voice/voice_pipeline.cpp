@@ -47,18 +47,6 @@ VoicePipeline::VoicePipeline()
 
 VoicePipeline::~VoicePipeline() { stop(); }
 
-bool VoicePipeline::init(const WorldConfig& cfg,
-                         WineFoxCore* core,
-                         ipc::SpscQueue<ipc::RenderEvent, 256>* render_events) {
-    // Synchronous init (legacy path). Use init_models + set_core +
-    // init_audio_io for async startup.
-    if (!init_models(cfg, render_events)) return false;
-    set_core(core);
-    if (!init_audio_io()) return false;
-    std::fprintf(stderr, "[pipeline] all services initialised\n");
-    return true;
-}
-
 bool VoicePipeline::init_models(const WorldConfig& cfg,
                                  ipc::SpscQueue<ipc::RenderEvent, 256>* render_events) {
     cfg_ = cfg;
@@ -331,7 +319,7 @@ void VoicePipeline::process_turn_(const std::vector<int16_t>& speech) {
     // Emit perf data.
     WineFoxPerf perf;
     winefox_last_perf(core_, &perf);
-    emit_perf_(perf.n_eval, perf.tokens_per_sec, perf.t_prefill_ms);
+    emit_perf_(perf.n_eval, perf.tokens_per_sec);
 
     // Wait for playback to drain (SDL audio stream finishes playing).
     if (state_.load() == PipelineState::SPEAKING) {
@@ -373,7 +361,7 @@ void VoicePipeline::emit_emotion_(const std::string& tag) {
     if (render_events_) render_events_->try_push(e);
 }
 
-void VoicePipeline::emit_perf_(int n_eval, double tps, double prefill_ms) {
+void VoicePipeline::emit_perf_(int n_eval, double tps) {
     ipc::RenderEvent e;
     e.kind      = ipc::RenderEventKind::Perf;
     e.int_val   = n_eval;

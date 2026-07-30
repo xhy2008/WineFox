@@ -35,7 +35,6 @@ private:
     int         threads_   = 4;
     bool        use_itn_   = true;
     bool        flash_attn_ = true;
-    void*       vad_model_ = nullptr;  // silero-vad model (owned by ctx)
 };
 
 } // namespace world

@@ -13,8 +13,6 @@
 
 #include "aec_service.h"
 
-#include <algorithm>
-#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -36,7 +34,6 @@ struct NlmsState {
     float    w[kFilterLen] = {};       // adaptive filter coefficients
     float    far_buf[kFilterLen] = {}; // far-end reference history (ring)
     int      far_pos = 0;              // ring buffer write position
-    bool     initialized = false;
 };
 
 } // namespace
@@ -47,9 +44,6 @@ bool AecService::init(int level) {
     if (!enabled_) return true;  // pass-through mode
 
     handle_ = new NlmsState();
-    auto* s = static_cast<NlmsState*>(handle_);
-    std::memset(s, 0, sizeof(NlmsState));
-    s->initialized = true;
 
     near_f_.resize(kFrameSize);
     far_f_.resize(kFrameSize);

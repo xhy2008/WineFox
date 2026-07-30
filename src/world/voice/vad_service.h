@@ -21,7 +21,6 @@
 
 #include <cstdint>
 #include <functional>
-#include <string>
 #include <vector>
 
 namespace winefox {
@@ -58,7 +57,6 @@ public:
 
     bool ready() const { return handle_ != nullptr; }
     int  hop_size() const { return hop_size_; }
-    const char* version() const;
 
 private:
     void* handle_ = nullptr;  // ten_vad_handle_t

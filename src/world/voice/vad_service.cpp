@@ -216,9 +216,5 @@ void VadService::reset() {
     segment_audio_.clear();
 }
 
-const char* VadService::version() const {
-    return ten_vad_get_version();
-}
-
 } // namespace world
 } // namespace winefox

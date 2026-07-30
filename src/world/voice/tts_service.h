@@ -11,7 +11,6 @@
 
 #include <cstdint>
 #include <functional>
-#include <memory>
 #include <string>
 #include <vector>
 
@@ -41,10 +40,6 @@ public:
     void synth_stream(const std::string& text, float speed,
                       const std::string& voice_name,
                       AudioCallback on_audio);
-
-    // Non-streaming: synthesize the full text at once.
-    std::vector<int16_t> synth(const std::string& text, float speed,
-                                const std::string& voice_name);
 
     bool ready() const { return kokoro_ != nullptr; }
 
