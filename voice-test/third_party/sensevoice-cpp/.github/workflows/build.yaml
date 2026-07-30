@@ -1,0 +1,495 @@
+name: CI
+on: [push, pull_request]
+
+env:
+  ubuntu_image: "tonistiigi/binfmt:qemu-v7.0.0-28"
+
+jobs:
+  ubuntu-22:
+    runs-on: ubuntu-22.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [linux/amd64, linux/arm64, linux/arm/v7, linux/ppc64le]
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build ${{ matrix.arch }}
+        run: |
+          docker run --platform ${{ matrix.arch }} --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace ${{ env.ubuntu_image }} /bin/sh -c '
+            set -e
+            apt update
+            apt install -y build-essential git cmake libsdl2-dev
+            git config --global --add safe.directory /workspace
+            git config --global --add safe.directory /workspace/sense-voice/csrc/third-party/ggml
+            git submodule sync && git submodule update --init --recursive
+            cmake -DGGML_NATIVE=OFF . 
+            make'
+
+  macOS-latest:
+    runs-on: macOS-latest
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v4
+
+      - name: Dependencies
+        run: |
+          brew update
+          brew install git cmake
+
+      - name: Build
+        run: |
+          git submodule sync && git submodule update --init --recursive
+          cmake .
+          make
+
+
+  ubuntu-22-gcc:
+    runs-on: ubuntu-22.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        build: [Debug, Release]
+        arch: [linux/amd64, linux/arm64, linux/arm/v7, linux/ppc64le]
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build ${{ matrix.arch }}
+        run: |
+          docker run --platform ${{ matrix.arch }} --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace ${{ env.ubuntu_image }} /bin/sh -c '
+            set -e
+            apt update
+            apt install -y build-essential libsdl2-dev cmake git
+            git config --global --add safe.directory /workspace
+            git config --global --add safe.directory /workspace/sense-voice/csrc/third-party/ggml
+            git submodule sync && git submodule update --init --recursive
+            cmake . -DGGML_NATIVE=OFF -DCMAKE_BUILD_TYPE=${{ matrix.build }}
+            make
+            ctest -L gh --output-on-failure'
+
+  ubuntu-22-clang:
+    runs-on: ubuntu-22.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        build: [Debug, Release]
+        #arch: [linux/amd64, linux/arm64, linux/arm/v7, linux/ppc64le]
+        # TODO: arm/v7 disabled due to clang bug
+        arch: [linux/amd64, linux/arm64, linux/ppc64le]
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build ${{ matrix.arch }}
+        run: |
+          docker run --platform ${{ matrix.arch }} --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace ${{ env.ubuntu_image }} /bin/sh -c '
+            set -e
+            apt update
+            apt install -y clang build-essential libsdl2-dev cmake git
+            git config --global --add safe.directory /workspace
+            git config --global --add safe.directory /workspace/sense-voice/csrc/third-party/ggml
+            git submodule sync && git submodule update --init --recursive
+            cmake . -DCMAKE_BUILD_TYPE=${{ matrix.build }} -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang
+            make'
+
+  ubuntu-22-gcc-sanitized:
+    runs-on: ubuntu-22.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [ADDRESS, THREAD, UNDEFINED]
+        arch: [linux/amd64]
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build ${{ matrix.arch }}
+        run: |
+          docker run --platform ${{ matrix.arch }} --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace ${{ env.ubuntu_image }} /bin/sh -c '
+            set -e
+            apt update
+            apt install -y build-essential libsdl2-dev cmake git
+            git config --global --add safe.directory /workspace
+            git config --global --add safe.directory /workspace/sense-voice/csrc/third-party/ggml
+            git submodule sync && git submodule update --init --recursive
+            cmake . -DCMAKE_BUILD_TYPE=Debug -DSENSE_VOICE_SANITIZE_${{ matrix.sanitizer }}=ON
+            make'
+
+  #  ubuntu-22-cmake-sycl:
+  #    runs-on: ubuntu-22.04
+  #
+  #    strategy:
+  #      fail-fast: false
+  #      matrix:
+  #        dggml_sycl: [ON]
+  #        dcmake_c_compiler: [icx]
+  #        dcmake_cxx_compiler: [icpx]
+  #        arch: [linux/amd64, linux/arm64, linux/arm/v7, linux/ppc64le]
+  #
+  #    continue-on-error: true
+  #
+  #    steps:
+  #      - name: Clone
+  #        uses: actions/checkout@v4
+  #
+  #      - name: add oneAPI to apt
+  #        shell: bash
+  #        run: |
+  #          cd /tmp
+  #          wget https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+  #          sudo apt-key add GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+  #          rm GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+  #          sudo add-apt-repository "deb https://apt.repos.intel.com/oneapi all main"
+  #
+  #      - name: install oneAPI dpcpp compiler
+  #        shell: bash
+  #        run: |
+  #          sudo apt update
+  #          sudo apt install intel-oneapi-compiler-dpcpp-cpp git cmake -y
+  #
+  #      - name: install oneAPI MKL library
+  #        shell: bash
+  #        run: |
+  #          sudo apt install intel-oneapi-mkl-devel
+  #
+  #      - name: Clone
+  #        id: checkout
+  #        uses: actions/checkout@v4
+  #
+  #      - name: Build
+  #        id: cmake_build
+  #        run: |
+  #          source /opt/intel/oneapi/setvars.sh
+  #          git config --global --add safe.directory /workspace
+  #          git config --global --add safe.directory /workspace/sense-voice/csrc/third-party/ggml
+  #          git submodule sync && git submodule update --init --recursive
+  #          mkdir build
+  #          cd build
+  #          cmake -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx ..
+  #          cmake --build . --config Release -j $(nproc)
+  #
+  #  ubuntu-22-cmake-sycl-fp16:
+  #    runs-on: ubuntu-22.04
+  #
+  #    strategy:
+  #      fail-fast: false
+  #      matrix:
+  #        dggml_sycl: [ON]
+  #        dcmake_c_compiler: [icx]
+  #        dcmake_cxx_compiler: [icpx]
+  #        arch: [linux/amd64, linux/arm64, linux/arm/v7, linux/ppc64le]
+  #
+  #    continue-on-error: true
+  #
+  #    steps:
+  #      - name: Clone
+  #        uses: actions/checkout@v4
+  #
+  #      - name: add oneAPI to apt
+  #        shell: bash
+  #        run: |
+  #          cd /tmp
+  #          wget https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+  #          sudo apt-key add GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+  #          rm GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+  #          sudo add-apt-repository "deb https://apt.repos.intel.com/oneapi all main"
+  #
+  #      - name: install oneAPI dpcpp compiler
+  #        shell: bash
+  #        run: |
+  #          sudo apt update
+  #          sudo apt install intel-oneapi-compiler-dpcpp-cpp cmake git -y
+  #
+  #      - name: install oneAPI MKL library
+  #        shell: bash
+  #        run: |
+  #          sudo apt install intel-oneapi-mkl-devel
+  #
+  #      - name: Clone
+  #        id: checkout
+  #        uses: actions/checkout@v4
+  #
+  #      - name: Build
+  #        id: cmake_build
+  #        run: |
+  #          source /opt/intel/oneapi/setvars.sh
+  #          git config --global --add safe.directory /workspace
+  #          git config --global --add safe.directory /workspace/sense-voice/csrc/third-party/ggml
+  #          git submodule sync && git submodule update --init --recursive
+  #          mkdir build
+  #          cd build
+  #          cmake -DGGML_SYCL_F16=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx ..
+  #          cmake --build . --config Release -j $(nproc)
+
+  windows-msys2:
+    runs-on: windows-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { sys: CLANG64, env: clang-x86_64, build: Release }
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v4
+
+      - name: Setup ${{ matrix.sys }}
+        uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          msystem: ${{matrix.sys}}
+          install: >-
+            base-devel
+            mingw-w64-${{matrix.env}}-toolchain
+            mingw-w64-${{matrix.env}}-cmake
+            mingw-w64-${{matrix.env}}-openblas
+
+      - name: Build using CMake
+        shell: msys2 {0}
+        run: |
+          export PATH="$PATH:/c/Program Files/Git/bin:/c/Program Files/Git/cmd"
+          /c/Program\ Files/Git/cmd/git.exe submodule sync
+          /c/Program\ Files/Git/cmd/git.exe submodule update --init --recursive
+          cmake -B build
+          cmake --build build --config ${{ matrix.build }} -j $(nproc)
+
+      - name: Clean after building using CMake
+        shell: msys2 {0}
+        run: |
+          rm -rf build
+
+      - name: Build using CMake w/ OpenBLAS
+        shell: msys2 {0}
+        run: |
+          export PATH="$PATH:/c/Program Files/Git/bin:/c/Program Files/Git/cmd"
+          git submodule sync && git submodule update --init --recursive
+          cmake -B build -DGGML_OPENBLAS=ON -DGGML_NATIVE=OFF
+          cmake --build build --config ${{ matrix.build }} -j $(nproc)
+
+  windows:
+    runs-on: windows-latest
+
+    strategy:
+      matrix:
+        build: [Release]
+        arch: [Win32, x64]
+        include:
+          - arch: Win32
+            s2arc: x86
+            jnaPath: win32-x86
+          - arch: x64
+            s2arc: x64
+            jnaPath: win32-x86-64
+
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v4
+
+      - name: Add msbuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup Git for Windows' minimal SDK
+        uses: git-for-windows/setup-git-for-windows-sdk@v1
+
+      - name: Configure
+        run: |
+          git submodule sync && git submodule update --init --recursive
+          cmake -S . -B ./build -A ${{ matrix.arch }} -DCMAKE_BUILD_TYPE=${{ matrix.build }}
+
+
+      - name: Build
+        run: |
+          cd ./build
+          msbuild ALL_BUILD.vcxproj -t:build -p:configuration=${{ matrix.build }} -p:platform=${{ matrix.arch }}
+
+      - name: Upload dll
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.jnaPath }}_sense_voice.dll
+          path: build/bin/${{ matrix.build }}/sense_voice.dll
+
+      - name: Upload binaries
+        if: matrix.sdl2 == 'ON'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sense-voice-bin-${{ matrix.arch }}
+          path: build/bin/${{ matrix.build }}
+
+  windows-blas:
+    runs-on: windows-latest
+
+    strategy:
+      matrix:
+        build: [Release]
+        arch: [Win32, x64]
+        blas: [ON]
+        sdl2: [ON]
+        include:
+          - arch: Win32
+            obzip: https://github.com/OpenMathLib/OpenBLAS/releases/download/v0.3.25/OpenBLAS-0.3.25-x86.zip
+            s2arc: x86
+          - arch: x64
+            obzip: https://github.com/OpenMathLib/OpenBLAS/releases/download/v0.3.25/OpenBLAS-0.3.25-x64.zip
+            s2arc: x64
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v4
+
+      - name: Add msbuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Fetch OpenBLAS
+        if: matrix.blas == 'ON'
+        run: |
+          C:/msys64/usr/bin/wget.exe -qO blas.zip ${{ matrix.obzip }}
+          7z x blas.zip -oblas -y
+          copy blas/include/cblas.h .
+          copy blas/include/openblas_config.h .
+          echo "OPENBLAS_PATH=$env:GITHUB_WORKSPACE/blas" >> $env:GITHUB_ENV
+
+      - name: Setup Git for Windows' minimal SDK
+        uses: git-for-windows/setup-git-for-windows-sdk@v1
+
+      - name: Configure
+        run: |
+          git submodule sync && git submodule update --init --recursive
+          cmake -S . -B ./build -A ${{ matrix.arch }} -DCMAKE_BUILD_TYPE=${{ matrix.build }} -DGGML_OPENBLAS=${{ matrix.blas }} -DCMAKE_LIBRARY_PATH="$env:OPENBLAS_PATH/lib"
+
+      - name: Build
+        run: |
+          cd ./build
+          msbuild ALL_BUILD.vcxproj -t:build -p:configuration=${{ matrix.build }} -p:platform=${{ matrix.arch }}
+
+      - name: Copy libopenblas.dll
+        if: matrix.blas == 'ON'
+        run: copy "$env:OPENBLAS_PATH/bin/libopenblas.dll" build/bin/${{ matrix.build }}
+
+
+      - name: Upload binaries
+        if: matrix.blas == 'ON' && matrix.sdl2 == 'ON'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sense-voice-blas-bin-${{ matrix.arch }}
+          path: build/bin/${{ matrix.build }}
+
+  windows-cublas:
+    runs-on: windows-2019
+
+    strategy:
+      matrix:
+        build: [ Release ]
+        arch: [ x64 ]
+        cublas: [ ON ]
+        sdl2: [ ON ]
+        cuda-toolkit: [ 12.2.0, 11.8.0 ]
+        include:
+          - arch: x64
+            s2arc: x64
+          - sdl2: ON
+            s2ver: 2.28.5
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v4
+
+      - name: Add msbuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install CUDA Toolkit
+        id: cuda-toolkit
+        uses: Jimver/cuda-toolkit@v0.2.15
+        with:
+          cuda: '${{ matrix.cuda-toolkit }}'
+
+
+      - name: Configure
+        run: |
+          git submodule sync && git submodule update --init --recursive
+          cmake -S . -B ./build -A ${{ matrix.arch }} -DCMAKE_BUILD_TYPE=${{ matrix.build }} -DGGML_CUDA=${{ matrix.cublas }}
+
+      - name: Build ${{ matrix.cuda-toolkit }}
+        run: |
+          cd ./build
+          cmake --build . --config ${{ matrix.build }}
+
+      - name: Copy CUDA DLLs
+        run: >
+          Copy-Item -PassThru
+          -Path "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}/bin/*.dll"
+          -Include cudart64_*,cublas64_*,cublasLt64_*
+          -Destination build/bin/${{ matrix.build }}
+
+
+      - name: Upload binaries
+        if: matrix.sdl2 == 'ON'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sense-voice-cublas-${{ matrix.cuda-toolkit }}-bin-${{ matrix.arch }}
+          path: build/bin/${{ matrix.build }}
+
+  openEuler-latest-cmake-cann:
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'Ascend NPU') }}
+    defaults:
+      run:
+        shell: bash -el {0}
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      matrix:
+        cann:
+          - '8.0.rc3.beta1-910b-openeuler22.03-py3.10'
+        device:
+          - 'ascend910b3'
+        build:
+          - 'Release'
+    container: ascendai/cann:${{ matrix.cann }}
+    steps:
+      - name: Dependencies
+        run: |
+          yum update -y
+          yum install -y git gcc gcc-c++ make cmake
+
+      - name: Build
+        run: |
+          export LD_LIBRARY_PATH=${ASCEND_TOOLKIT_HOME}/lib64:${ASCEND_TOOLKIT_HOME}/$(uname -m)-linux/devlib/:${LD_LIBRARY_PATH}
+          git clone https://github.com/lovemefan/SenseVoice.cpp.git 
+          cd SenseVoice.cpp && git submodule sync && git submodule update --init --recursive
+          cmake -S . -B build \
+              -DCMAKE_BUILD_TYPE=${{ matrix.build }} \
+              -DGGML_CANN=on \
+              -DSOC_TYPE=${{ matrix.device }}
+          cmake --build build -j $(nproc)
+

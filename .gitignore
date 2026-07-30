@@ -61,6 +61,7 @@ CMakeUserPresets.json
 logs/
 *.log
 *.log.err
+/winefox.json
 
 # OS junk
 Thumbs.db
