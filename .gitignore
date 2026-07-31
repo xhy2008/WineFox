@@ -49,6 +49,40 @@ CMakeUserPresets.json
 /voice-test/test-data/
 
 # ---------------------------------------------------------------------------
+# vulkan-test sandbox
+# ---------------------------------------------------------------------------
+
+# Build artifacts (also covered by /build-*/ at root)
+/vulkan-test/build/
+
+# ---------------------------------------------------------------------------
+# tts-training (offline training workspace — keep scripts, ignore data/weights)
+# ---------------------------------------------------------------------------
+
+# Audio samples and generated datasets
+/tts-training/**/*.wav
+/tts-training/**/*.mp3
+/tts-training/**/*.flac
+
+# Model weights and binary artifacts
+/tts-training/**/*.pt
+/tts-training/**/*.pth
+/tts-training/**/*.ckpt
+/tts-training/**/*.safetensors
+/tts-training/**/*.npy
+/tts-training/**/*.pkl
+/tts-training/**/*.bin
+
+# Dataset manifests / large CSVs
+/tts-training/**/manifest.jsonl
+/tts-training/**/metadata.csv
+/tts-training/**/routing_decisions.csv
+/tts-training/**/audio_audit.json
+/tts-training/**/needs_review.jsonl
+/tts-training/**/stats.json
+/tts-training/**/corpus.txt
+
+# ---------------------------------------------------------------------------
 # Runtime data
 # ---------------------------------------------------------------------------
 *.db

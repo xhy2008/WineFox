@@ -337,6 +337,48 @@
 
 ---
 
+## Phase 3.5：Vulkan 渲染技术验证（vulkan-test 沙盒）
+
+> 目标：在独立沙盒项目中验证 Vulkan 3D 渲染管线，为 Phase 4 GUI 铺路。
+> **不依赖** winefox_core.dll 或任何语音组件，仅 SDL3 + Vulkan SDK + glm。
+
+### 3.5.1 基础渲染管线
+
+- [x] `vulkan-test/CMakeLists.txt`：独立构建配置（SDL3 静态链接、Vulkan SDK、glslc 着色器编译）
+- [x] `vulkan-test/src/vulkan_app.h/cpp`：完整 Vulkan 渲染管线
+  - Instance + debug messenger → surface → physical device → logical device
+  - Swapchain → render pass (color + depth) → graphics pipeline
+  - Framebuffers → vertex/index buffers (staging) → command buffers
+  - Sync objects (MAX_FRAMES_IN_FLIGHT = 2)
+- [x] `vulkan-test/shaders/cube.vert` + `cube.frag`：MVP push constant + 环境光/漫反射光照
+- [x] 深度缓冲（D32_SFLOAT）+ 深度测试
+- [x] **修复崩溃 bug**：`VkPipelineShaderStageCreateInfo stages[2]` 未零初始化导致 `pNext` 野指针，`vkCreateGraphicsPipelines` 访问违规（退出码 0xC0000005）
+
+### 3.5.2 相机与交互
+
+- [x] `vulkan-test/src/camera.h`：FPS 相机（glm 球坐标 → 欧拉角）
+  - Y 轴翻转（Vulkan NDC Y 朝下，`p[1][1] *= -1`）
+  - 俯仰角 clamp（±1.55 rad，避免万向锁翻转）
+  - `forward_flat()`：XZ 平面投影前向（WSAD 走路不受俯仰影响）
+- [x] 鼠标捕获：`SDL_SetWindowRelativeMouseMode`（指针锁定窗口中心，ESC 释放/退出）
+- [x] WASD 移动 + QE 升降 + 滚轮调速（帧率无关，`dt` 驱动）
+- [x] FPS 显示（标题栏，每秒更新）
+
+### 3.5.3 封闭房间场景
+
+- [x] 20×20×20 封闭房间几何体（法线朝内，6 面不同颜色）
+- [x] 索引绕序反转（从内部看为 CCW 正面）
+- [x] 背面剔除 `VK_CULL_MODE_BACK_BIT`（为后期复杂模型性能准备）
+- [x] 垂直同步 `VK_PRESENT_MODE_FIFO_KHR`（防止撕裂）
+
+**Phase 3.5 验收**：
+- [x] Vulkan 完整管线初始化无崩溃（AMD Radeon Vega 8 Graphics）
+- [x] 封闭房间六面彩色墙正确渲染，背面剔除生效
+- [x] FPS 相机自由漫游（WASD + 鼠标视角 + QE 升降）
+- [x] V-Sync 60FPS 稳定，标题栏实时显示帧率/坐标/速度
+
+---
+
 ## Phase 4：GUI 与酒狐形象（Windows）
 
 > 目标：图形界面 + 酒狐形象 + 情感驱动动画。分三步实现（对齐 [11.2.3](./PLAN.md#L866-L873)）。
