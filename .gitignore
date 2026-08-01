@@ -82,6 +82,19 @@ CMakeUserPresets.json
 /tts-training/**/stats.json
 /tts-training/**/corpus.txt
 
+# Third-party cloned repos (StyleTTS2 reference implementation, large)
+/tts-training/StyleTTS2/
+
+# Generated training datasets (wavs + manifests, ~170MB)
+/tts-training/ref3_tts_dataset_routed_500/
+
+# Local training checkpoints
+/tts-training/checkpoints/
+/tts-training/verify_output/
+
+# Zip archives
+/tts-training/**/*.zip
+
 # ---------------------------------------------------------------------------
 # Runtime data
 # ---------------------------------------------------------------------------

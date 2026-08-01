@@ -1,0 +1,13 @@
+# Kokoro voice style 本地 GPU 训练依赖
+# P106-100 (Pascal, 6GB, compute capability 6.1)
+# torch 2.4.1 是 Pascal 架构最后一个完全支持的版本
+#
+# 安装顺序:
+#   1. 先装 torch: pip install torch==2.4.1 torchaudio --index-url https://download.pytorch.org/whl/cu121
+#   2. 再装其他: pip install -r requirements.txt
+
+kokoro>=0.9
+misaki[zh]
+soundfile
+huggingface_hub
+numpy
