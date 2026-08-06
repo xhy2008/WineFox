@@ -37,11 +37,13 @@ public:
     //                 (INT8 QDQ, ~25% smaller, Conv-only quantization)
     //   decoder_path: kokoro-decoder-int8-static.onnx (INT8) or kokoro-decoder.onnx (FP32)
     //   n_threads: 0 = auto (physical cores), >0 = explicit thread count
+    //   dict_dir: G2P dictionary directory (default "dict/")
     Kokoro(const std::string& encoder_path,
            const std::string& decoder_path,
            const std::string& voices_path,
            const std::string& vocab_path,
-           int n_threads = 0);
+           int n_threads = 0,
+           const std::string& dict_dir = "");
 
     // Merged mode constructor (legacy).
     Kokoro(const std::string& model_path,
@@ -88,6 +90,9 @@ public:
 
     // Report which mode the engine is running in.
     bool is_split_mode() const { return split_mode_; }
+
+    // Debug: phonemize text without synthesizing (used by --phonemize).
+    std::string phonemize_debug(const std::string& text);
 
 private:
     Ort::Env env_;

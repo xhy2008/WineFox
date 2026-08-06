@@ -11,12 +11,12 @@
 // ==========================================
 
 static const std::unordered_map<std::string, std::vector<std::string>> INITIAL_MAPPING = {
-    {"b", {"p"}}, {"c", {"ʦʰ"}}, {"ch", {"ʈʂʰ"}}, {"d", {"t"}},
+    {"b", {"p"}}, {"c", {"ʦʰ"}}, {"ch", {"ꭧʰ"}}, {"d", {"t"}},
     {"f", {"f"}}, {"g", {"k"}}, {"h", {"x"}}, {"j", {"ʨ"}},
     {"k", {"kʰ"}}, {"l", {"l"}}, {"m", {"m"}}, {"n", {"n"}},
     {"p", {"pʰ"}}, {"q", {"ʨʰ"}}, {"r", {"ɻ"}}, {"s", {"s"}},
     {"sh", {"ʂ"}}, {"t", {"tʰ"}}, {"x", {"ɕ"}}, {"z", {"ʦ"}},
-    {"zh", {"ʈʂ"}}
+    {"zh", {"ꭧ"}}
 };
 
 static const std::unordered_map<std::string, std::vector<std::string>> FINAL_MAPPING = {
@@ -211,7 +211,17 @@ ZHG2P::PinyinParts ZHG2P::parse_pinyin(const std::string& raw_pinyin) {
 
     parts.initial = p_initial;
     parts.final = base.substr(p_initial.length());
-    
+
+    // j/q/x + "u" is written without the umlaut but is actually "ü"
+    // (qu, ju, xu, quan, jue, jun, xun...). Kokoro/misaki render these
+    // with the y/ɥ vowels, so map them back to the ü forms here.
+    if (p_initial == "j" || p_initial == "q" || p_initial == "x") {
+        if      (parts.final == "u")    parts.final = "ü";
+        else if (parts.final == "uan")  parts.final = "üan";
+        else if (parts.final == "ue")   parts.final = "üe";
+        else if (parts.final == "un")   parts.final = "ün";
+    }
+
     return parts;
 }
 
@@ -275,6 +285,11 @@ std::string ZHG2P::py2ipa(const std::string& py) {
 
 std::string ZHG2P::map_punctuation(std::string text) {
     // Note: using u8 string literals
+    // ASCII ellipsis (2+ dots) -> single "…" pause token. The C++ engine
+    // splits phoneme batches at ".", so "..." would become three
+    // punctuation-only batches producing audible garbage. "…" (id 10) is
+    // the pause token the model expects and does not split batches.
+    text = std::regex_replace(text, std::regex("\\.{2,}"), "…");
     text = replace_all(text, u8"、", ", ");
     text = replace_all(text, u8"，", ", ");
     text = replace_all(text, u8"。", ". ");
@@ -398,6 +413,16 @@ std::pair<std::string, std::string> ZHG2P::operator()(const std::string& text) {
                      result += converted_part;
                  }
              } else {
+                 // Kokoro/misaki insert a space token (id 16) between
+                 // words; the model was trained with those, so omitting
+                 // them shifts predicted durations/F0 and distorts the
+                 // audio. Punctuation and "…" attach without a space,
+                 // matching misaki's output ("…" = UTF-8 E2 80 A6).
+                 bool last_is_ellipsis = result.size() >= 3 &&
+                     result.compare(result.size() - 3, 3, "\xE2\x80\xA6") == 0;
+                 if (!result.empty() && result.back() != ' ' && !last_is_ellipsis) {
+                     result += " ";
+                 }
                  // Split phonemes into pinyin syllables based on tone digits
                  std::string pinyin_acc;
                  for (const auto& p : tk.phonemes) {

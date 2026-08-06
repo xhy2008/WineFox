@@ -55,6 +55,7 @@ struct TtsArgs {
     std::string out_path    = "tts_output.wav";
     float       speed       = 1.0f;
     bool        stream      = false;
+    bool        phonemize_only = false;
 };
 
 bool parse_args(const std::vector<std::string>& args, TtsArgs& out) {
@@ -79,6 +80,10 @@ bool parse_args(const std::vector<std::string>& args, TtsArgs& out) {
         else if (a == "--threads")   out.threads      = std::stoi(next("--threads"));
         else if (a == "--stream")    out.stream       = true;
         else if (a == "--text-file") out.text_file    = next("--text-file");
+        else if (a == "--no-f0-fix") { /* deprecated, kept for compat */ }
+        else if (a == "--f0-slope")  { next("--f0-slope"); /* deprecated */ }
+        else if (a == "--f0-std")    { next("--f0-std"); /* deprecated */ }
+        else if (a == "--phonemize") out.phonemize_only = true;
         else if (a.rfind("--", 0) == 0) {
             std::fprintf(stderr, "tts: unknown option %s\n", a.c_str());
             return false;
@@ -163,7 +168,7 @@ int run_tts(const std::vector<std::string>& args) {
     if (split_mode) {
         kokoro = std::make_unique<Kokoro>(
             ta.encoder_path, ta.decoder_path, ta.voices_path,
-            ta.vocab_path, ta.threads);
+            ta.vocab_path, ta.threads, ta.dict_dir);
     } else {
         kokoro = std::make_unique<Kokoro>(
             ta.model_path, ta.voices_path, ta.vocab_path);
@@ -180,6 +185,12 @@ int run_tts(const std::vector<std::string>& args) {
     // -------------------------------------------------------------------
     std::vector<float> audio_f32;
     int sample_rate = SAMPLE_RATE;
+
+    if (ta.phonemize_only) {
+        std::string phonemes = kokoro->phonemize_debug(ta.text);
+        std::printf("%s\n", phonemes.c_str());
+        return 0;
+    }
 
     if (ta.stream) {
         // Streaming mode: emit audio per sentence batch, measure TTFB.

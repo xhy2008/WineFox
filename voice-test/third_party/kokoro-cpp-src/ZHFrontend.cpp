@@ -24,6 +24,16 @@ ZHFrontend::ZHFrontend(std::shared_ptr<TextProcessor> processor, const std::stri
 ZHFrontend::InitFinal ZHFrontend::_get_initials_finals(const std::string& word) {
     InitFinal res;
     auto pinyins = processor->word_to_pinyin(word);
+
+    // 嗯 (U+55EF, UTF-8 E5 97 AF): missing from pinyin.txt so word_to_pinyin
+    // degrades to a bare "n". Kokoro/misaki render it with a rising tone
+    // "n↗". Produce initial "n" + final "↗" — in ZHG2P::operator() the
+    // digit-less "↗" flows through py2ipa unchanged, yielding "n↗".
+    if (word == u8"嗯") {
+        res.initials.push_back("n");
+        res.finals.push_back("↗");
+        return res;
+    }
     
     // Handle '嗯' special case check
     // Check if word contains 嗯 (UTF-8: E5 97 AF)

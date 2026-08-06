@@ -1,0 +1,14 @@
+{
+  "id": "xhygx0/winefox-distill-try",
+  "title": "winefox-distill-try",
+  "code_file": "winefox_distill.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": ["xhygx0/winefox-dataset"],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

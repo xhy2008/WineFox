@@ -1,0 +1,10 @@
+# Kokoro 音色蒸馏 - Kaggle 依赖
+# Kokoro TTS (PyTorch 原生模型，含中文 G2P)
+kokoro>=0.9.4
+# ECAPA-TDNN 说话人嵌入 (音色匹配)
+speechbrain>=0.5.16
+# 音频处理
+torchaudio
+librosa
+soundfile
+numpy

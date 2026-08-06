@@ -183,13 +183,18 @@ if(VOICE_TEST_ENABLE_TTS)
         message(FATAL_ERROR "VOICE_TEST_ENABLE_TTS: kokoro.cpp sources not found under ${KOKORO_SRC_ROOT}")
     endif()
 
-    # onnxruntime: use the prebuilt static lib extracted from kokoro.cpp's zip
+    # onnxruntime: use the prebuilt static lib.
+    # Looks for onnxruntime.lib under ONNXRUNTIME_ROOT (either directly or in lib/).
     if(NOT ONNXRUNTIME_ROOT)
-        set(ONNXRUNTIME_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime-prebuilt")
+        set(ONNXRUNTIME_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime-static")
     endif()
-    if(NOT EXISTS "${ONNXRUNTIME_ROOT}/onnxruntime.lib")
+    set(_ORT_LIB "${ONNXRUNTIME_ROOT}/onnxruntime.lib")
+    if(NOT EXISTS "${_ORT_LIB}")
+        set(_ORT_LIB "${ONNXRUNTIME_ROOT}/lib/onnxruntime.lib")
+    endif()
+    if(NOT EXISTS "${_ORT_LIB}")
         message(FATAL_ERROR "VOICE_TEST_ENABLE_TTS: onnxruntime.lib not found under ${ONNXRUNTIME_ROOT}. "
-            "Extract kokoro-cpp-src/third_party/onnxruntime/lib/windows_x64/onnxruntime.zip first.")
+            "Download static lib from https://github.com/csukuangfj/onnxruntime-libs/releases")
     endif()
 
     # Kokoro G2P + engine sources (compiled directly into voice_test).
@@ -207,12 +212,11 @@ if(VOICE_TEST_ENABLE_TTS)
         ${KOKORO_SRC_ROOT}
         ${KOKORO_SRC_ROOT}/third_party/cppjieba/include
         ${KOKORO_SRC_ROOT}/third_party/cppjieba/deps/limonp/include
-        ${KOKORO_SRC_ROOT}/third_party/onnxruntime/include
-        ${ONNXRUNTIME_ROOT}/../kokoro-cpp-src/third_party/onnxruntime/include
+        ${ONNXRUNTIME_ROOT}/include
     )
 
     if(WIN32)
-        target_link_libraries(voice_test PRIVATE ${ONNXRUNTIME_ROOT}/onnxruntime.lib)
+        target_link_libraries(voice_test PRIVATE ${_ORT_LIB})
         # onnxruntime static lib needs these Windows system libs
         target_link_libraries(voice_test PRIVATE
             Advapi32 Ws2_32 Shlwapi userenv Synchronization

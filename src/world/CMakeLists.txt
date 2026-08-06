@@ -42,7 +42,7 @@ endif()
 set(_voice_root "${CMAKE_SOURCE_DIR}/voice-test/third_party")
 set(SENSEVOICE_ROOT "${_voice_root}/sensevoice-cpp")
 set(KOKORO_SRC_ROOT  "${_voice_root}/kokoro-cpp-src")
-set(ONNXRUNTIME_ROOT "${_voice_root}/onnxruntime-prebuilt")
+set(ONNXRUNTIME_ROOT "${_voice_root}/onnxruntime-static")
 set(TEN_VAD_ROOT     "${_voice_root}/ten-vad")
 
 foreach(_d SENSEVOICE_ROOT KOKORO_SRC_ROOT ONNXRUNTIME_ROOT TEN_VAD_ROOT)
@@ -113,7 +113,7 @@ target_include_directories(winefox_world PRIVATE
     ${KOKORO_SRC_ROOT}                       # Kokoro.h
     ${KOKORO_SRC_ROOT}/third_party/cppjieba/include
     ${KOKORO_SRC_ROOT}/third_party/cppjieba/deps/limonp/include
-    ${KOKORO_SRC_ROOT}/third_party/onnxruntime/include
+    ${ONNXRUNTIME_ROOT}/include
     ${TEN_VAD_ROOT}/include
 )
 
@@ -141,7 +141,7 @@ target_sources(winefox_world PRIVATE
 
 # --- onnxruntime (static, for Kokoro TTS) ---
 if(WIN32)
-    target_link_libraries(winefox_world PRIVATE ${ONNXRUNTIME_ROOT}/onnxruntime.lib)
+    target_link_libraries(winefox_world PRIVATE ${ONNXRUNTIME_ROOT}/lib/onnxruntime.lib)
     target_link_libraries(winefox_world PRIVATE
         Advapi32 Ws2_32 Shlwapi userenv Synchronization
     )
@@ -200,12 +200,15 @@ endif()
 
 # models/ — create a junction (Windows directory symlink that doesn't
 # require admin privileges) so the exe can load model files without copying
-# multi-GB of data. voice-test/ and llm-finetune/ are dev-time only and
-# are NOT linked into the output directory.
+# multi-GB of data.
 if(WIN32)
     add_custom_command(TARGET winefox_world POST_BUILD
         COMMAND cmd /c "if not exist \"${_out_dir}\\models\" mklink /J \"${_out_dir}\\models\" \"${CMAKE_SOURCE_DIR}\\models\""
         COMMENT "Creating directory junction for models/")
+    # llm-finetune/ — needed at runtime for system_prompt.txt (small text files only).
+    add_custom_command(TARGET winefox_world POST_BUILD
+        COMMAND cmd /c "if not exist \"${_out_dir}\\llm-finetune\" mklink /J \"${_out_dir}\\llm-finetune\" \"${CMAKE_SOURCE_DIR}\\llm-finetune\""
+        COMMENT "Creating directory junction for llm-finetune/")
 endif()
 
 # Output to <binary_dir>/world for consistency

@@ -85,7 +85,8 @@ Kokoro::Kokoro(const std::string& encoder_path,
                const std::string& decoder_path,
                const std::string& voices_path,
                const std::string& vocab_path,
-               int n_threads)
+               int n_threads,
+               const std::string& dict_dir)
     : env_(ORT_LOGGING_LEVEL_WARNING, "Kokoro")
     , split_mode_(true)
     , n_threads_(resolve_threads(n_threads))
@@ -123,7 +124,9 @@ Kokoro::Kokoro(const std::string& encoder_path,
                 }
             }
         }
-        tokenizer_ = std::make_unique<Tokenizer>(TokenizerConfig{}, vocab);
+        TokenizerConfig cfg;
+        if (!dict_dir.empty()) cfg.dict_dir = dict_dir;
+        tokenizer_ = std::make_unique<Tokenizer>(cfg, vocab);
     });
 
     // Main thread: ONNX sessions (sequential — both use env_)
@@ -190,6 +193,11 @@ Kokoro::Kokoro(const std::string& model_path, const std::string& voices_path, co
 }
 
 Kokoro::~Kokoro() {}
+
+std::string Kokoro::phonemize_debug(const std::string& text) {
+    if (!tokenizer_) return text;
+    return tokenizer_->phonemize(text);
+}
 
 void Kokoro::load_voices(const std::string& voices_path) {
     voices_file_path_ = voices_path;

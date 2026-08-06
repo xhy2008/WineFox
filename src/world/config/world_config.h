@@ -36,7 +36,7 @@ struct WorldConfig {
         std::string voices_path;
         std::string vocab_path  = "dict/vocab.txt";
         std::string dict_dir    = "dict";
-        std::string voice_name  = "zf_001";
+        std::string voice_name  = "winefox";
         float       speed       = 1.0f;
         int         threads     = 0;      // 0 = auto
     } tts;
