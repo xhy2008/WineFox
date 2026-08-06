@@ -21,7 +21,7 @@
 //
 // Usage:
 //   voice_test stream <wav> --asr-model <gguf>
-//                         [--threshold 0.3] [--hop 256]
+//                         [--vad-model <ten-vad-ggml.bin>] [--threshold 0.3] [--hop 256]
 //                         [--min-speech 0.25] [--min-silence 0.30]
 //                         [--max-speech 30.0]
 //                         [--lang auto|zh|en|yue|ja|ko]
@@ -45,7 +45,7 @@
 #include <thread>
 #include <vector>
 
-#include "ten_vad.h"
+#include "ten_vad/ten_vad.h"
 
 #include "sense-voice.h"
 #include "silero-vad.h"  // full definition for proper cleanup
@@ -60,6 +60,7 @@ namespace {
 struct StreamArgs {
     std::string wav_path;
     std::string asr_model_path;
+    std::string vad_model_path = "models/vad/ten-vad-ggml.bin";
     std::string language       = "auto";
     std::string reference_path;   // optional: one transcript per line
     std::string out_path;
@@ -325,7 +326,7 @@ int run_stream(const std::vector<std::string>& args) {
     const int max_speech_frames  = std::max(min_speech_frames, int(sa.max_speech_s / frame_dur_s + 0.5));
 
     std::printf("voice_test stream\n");
-    std::printf("  pipeline   : VAD (ten-vad) -> ASR (SenseVoice.cpp/ggml)\n");
+    std::printf("  pipeline   : VAD (ten-vad-ggml) -> ASR (SenseVoice.cpp/ggml)\n");
     std::printf("  input      : %s\n", sa.wav_path.c_str());
     std::printf("  asr_model  : %s\n", sa.asr_model_path.c_str());
     std::printf("  language   : %s\n", sa.language.c_str());
@@ -344,11 +345,12 @@ int run_stream(const std::vector<std::string>& args) {
     std::printf("\n");
 
     // -----------------------------------------------------------------------
-    // Initialize ten-vad.
+    // Initialize ten-vad (TEN-VAD-GGML).
     // -----------------------------------------------------------------------
-    ten_vad_handle_t vad_handle = nullptr;
-    if (ten_vad_create(&vad_handle, size_t(hop), sa.threshold) != 0 || !vad_handle) {
-        std::fprintf(stderr, "stream: ten_vad_create failed\n");
+    ten_vad_ctx* vad_handle = ten_vad_create(sa.vad_model_path.c_str());
+    if (!vad_handle) {
+        std::fprintf(stderr, "stream: ten_vad_create failed (model=%s)\n",
+                     sa.vad_model_path.c_str());
         return 1;
     }
 
@@ -366,7 +368,7 @@ int run_stream(const std::vector<std::string>& args) {
     auto t_asr_load_end = std::chrono::steady_clock::now();
     if (!ctx) {
         std::fprintf(stderr, "stream: failed to initialize sense_voice context\n");
-        ten_vad_destroy(&vad_handle);
+        ten_vad_destroy(vad_handle);
         return 1;
     }
     const double asr_load_s = std::chrono::duration<double, std::milli>(
@@ -377,8 +379,8 @@ int run_stream(const std::vector<std::string>& args) {
         if (lid >= 0) ctx->language_id = lid;
     }
 
-    std::printf("Models loaded: VAD (ten-vad %s) + ASR (%.3f s)\n",
-                ten_vad_get_version(), asr_load_s);
+    std::printf("Models loaded: VAD (ten-vad-ggml %s) + ASR (%.3f s)\n",
+                sa.vad_model_path.c_str(), asr_load_s);
     std::printf("\n");
 
     // -----------------------------------------------------------------------
@@ -429,18 +431,8 @@ int run_stream(const std::vector<std::string>& args) {
         }
 
         // VAD process.
-        float prob = 0.0f;
-        int   flag = 0;
-        if (ten_vad_process(vad_handle, frame_buf.data(), size_t(hop), &prob, &flag) != 0) {
-            std::fprintf(stderr, "stream: ten_vad_process failed at frame %d\n", i);
-            ten_vad_destroy(&vad_handle);
-            sense_voice_free_state(ctx->state);
-            delete ctx->model.model->encoder;
-            delete ctx->model.model;
-            delete ctx->vad_model.model;
-            delete ctx;
-            return 1;
-        }
+        float prob = ten_vad_process(vad_handle, frame_buf.data(), size_t(hop));
+        int   flag = (prob >= sa.threshold) ? 1 : 0;
 
         size_t segs_before = seg.segments.size();
         seg.feed(i, flag);
@@ -628,7 +620,7 @@ int run_stream(const std::vector<std::string>& args) {
     }
 
     auto t_pipeline_end = std::chrono::steady_clock::now();
-    ten_vad_destroy(&vad_handle);
+    ten_vad_destroy(vad_handle);
 
     const double pipeline_s = std::chrono::duration<double, std::milli>(
         t_pipeline_end - t_pipeline_start).count() / 1000.0;

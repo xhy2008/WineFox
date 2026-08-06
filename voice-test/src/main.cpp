@@ -89,8 +89,8 @@ static void print_usage() {
         "\n");
 #if defined(VOICE_TEST_HAS_VAD)
     std::printf(
-        "  voice_test vad <wav> [--threshold 0.5] [--hop 256]\n"
-        "      Run ten-vad on <wav>, report detected speech segments and latency.\n"
+        "  voice_test vad <wav> [--model <ten-vad-ggml.bin>] [--threshold 0.5] [--hop 256]\n"
+        "      Run ten-vad-ggml on <wav>, report detected speech segments and latency.\n"
         "\n");
 #endif
 #if defined(VOICE_TEST_HAS_ASR)

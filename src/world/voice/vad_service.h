@@ -1,8 +1,8 @@
-// vad_service.h — Voice Activity Detection service (ten-vad + segmenter).
+// vad_service.h — Voice Activity Detection service (ten-vad-ggml + segmenter).
 //
-// Wraps the official ten-vad prebuilt lib (self-contained: ONNX model +
-// onnxruntime baked into ten_vad.dll) and adds a segment state machine on
-// top, since the ten-vad C API only exposes per-frame probability/flag.
+// Wraps the pure C++17 ten-vad-ggml library (no onnxruntime dependency) and
+// adds a segment state machine on top, since the ten-vad C API only exposes
+// per-frame probability.
 //
 // The segmenter consolidates frames into speech segments using configurable
 // min_speech / min_silence / max_speech thresholds, matching the conventions
@@ -10,7 +10,7 @@
 //
 // Usage:
 //   VadService vad;
-//   vad.init(threshold, hop_size, min_speech, min_silence, max_speech);
+//   vad.init(model_path, threshold, hop_size, min_speech, min_silence, max_speech);
 //   // feed audio frame-by-frame:
 //   for (each frame of hop_size samples) {
 //       vad.feed(frame, n_samples);
@@ -21,6 +21,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <vector>
 
 namespace winefox {
@@ -39,7 +40,8 @@ public:
     // Audio format: 16kHz mono int16.
     static constexpr int kSampleRate = 16000;
 
-    bool init(float threshold, int hop_size,
+    bool init(const std::string& model_path,
+              float threshold, int hop_size,
               float min_speech_s, float min_silence_s, float max_speech_s,
               SegmentCallback on_segment);
     ~VadService();
@@ -59,8 +61,9 @@ public:
     int  hop_size() const { return hop_size_; }
 
 private:
-    void* handle_ = nullptr;  // ten_vad_handle_t
+    void* handle_ = nullptr;  // ten_vad_ctx*
     int   hop_size_ = 256;
+    float threshold_ = 0.5f;
 
     // Segmenter state machine (ported from voice-test/src/vad_test.cpp)
     enum class State { SILENCE, PENDING_SPEECH, IN_SPEECH };

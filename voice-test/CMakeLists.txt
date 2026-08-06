@@ -1,7 +1,7 @@
 # voice-test: standalone voice front-end benchmark sandbox (Phase 2).
 #
 # New architecture (sherpa-onnx-free):
-#   VAD  : ten-vad  (onnxruntime, official prebuilt lib)
+#   VAD  : ten-vad-ggml (pure C++17 port, GGML model — no onnxruntime)
 #   ASR  : SenseVoice.cpp (ggml, shares ggml with llama.cpp)
 #   TTS  : Kokoro  (onnxruntime, G2P frontend from kokoro.cpp)
 #
@@ -46,7 +46,7 @@ endif()
 # ---------------------------------------------------------------------------
 # Component toggles. Each can be turned on once its deps are wired in.
 # ---------------------------------------------------------------------------
-option(VOICE_TEST_ENABLE_VAD  "Enable ten-vad VAD benchmark"               OFF)
+option(VOICE_TEST_ENABLE_VAD  "Enable ten-vad-ggml VAD benchmark"          OFF)
 option(VOICE_TEST_ENABLE_ASR  "Enable SenseVoice.cpp ASR benchmark"        OFF)
 option(VOICE_TEST_ENABLE_TTS  "Enable Kokoro TTS benchmark"                OFF)
 option(VOICE_TEST_ENABLE_STREAM "Enable full streaming VAD+ASR benchmark" OFF)
@@ -60,23 +60,26 @@ option(VOICE_TEST_ENABLE_STREAM "Enable full streaming VAD+ASR benchmark" OFF)
 # Third-party deps. Resolved lazily by each component; declared here so
 # the option summary is centralized.
 #
-#   ten-vad      : prebuilt lib pointed by TEN_VAD_ROOT.
-#                  The official prebuilt DLL is SELF-CONTAINED: the ONNX
-#                  model + onnxruntime are baked into ten_vad.dll, so VAD
-#                  does NOT need a separate onnxruntime install.
+#   ten-vad-ggml : git submodule at third_party/ten-vad-ggml (TEN_VAD_GGML_ROOT).
+#                  Pure C++17 reimplementation; reads a GGML model file
+#                  (models/vad/ten-vad-ggml.bin) at runtime. No onnxruntime,
+#                  no DLL, no shared runtime dependency.
 #   onnxruntime  : prebuilt package pointed by ONNXRUNTIME_ROOT.
 #                  Required by TTS (Kokoro) only.
 #   SenseVoice.cpp : add_subdirectory(third_party/sensevoice-cpp)
 #                    (shares ggml with llama.cpp; see notes below)
 #   Kokoro G2P   : header-only sources vendored under third_party/kokoro-cpp
 # ---------------------------------------------------------------------------
-set(TEN_VAD_ROOT      "" CACHE PATH "Path to ten-vad prebuilt package root (contains include/ and lib/). Empty = use bundled third_party/ten-vad")
+set(TEN_VAD_GGML_ROOT "" CACHE PATH "Path to TEN-VAD-GGML.cpp source root (contains cpp/CMakeLists.txt). Empty = use bundled third_party/ten-vad-ggml")
 set(ONNXRUNTIME_ROOT "" CACHE PATH "Path to onnxruntime prebuilt package root (TTS only; contains include/ and lib/)")
 set(SENSEVOICE_ROOT   "" CACHE PATH "Path to SenseVoice.cpp source root. Empty = use bundled third_party/sensevoice-cpp")
 
-# Fall back to the bundled prebuilt copy when the cache value is empty.
-if(NOT TEN_VAD_ROOT)
-    set(TEN_VAD_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ten-vad")
+# Fall back to the bundled copy when the cache value is empty.
+# The ten-vad-ggml submodule lives next to voice-test/ (sibling), i.e.
+# <winefox>/third_party/ten-vad-ggml, whether this CMakeLists is included
+# from the winefox root or configured standalone from voice-test/.
+if(NOT TEN_VAD_GGML_ROOT)
+    set(TEN_VAD_GGML_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/ten-vad-ggml")
 endif()
 if(NOT SENSEVOICE_ROOT)
     set(SENSEVOICE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/sensevoice-cpp")
@@ -93,38 +96,23 @@ add_executable(voice_test
 target_include_directories(voice_test PRIVATE src)
 
 # ---------------------------------------------------------------------------
-# Component: VAD (ten-vad official prebuilt lib, self-contained)
-#   The prebuilt ten_vad.dll embeds the ONNX model + onnxruntime, so no
-#   external onnxruntime install is needed for VAD. We only link the
-#   import lib and copy the DLL next to the executable at build time.
+# Component: VAD (TEN-VAD-GGML — pure C++17 port, GGML model)
+#   Vendored as a git submodule at third_party/ten-vad-ggml. The library
+#   loads a GGML model file (models/vad/ten-vad-ggml.bin) at runtime; no
+#   DLL and no onnxruntime. We build the static lib and link it directly.
 # ---------------------------------------------------------------------------
 if(VOICE_TEST_ENABLE_VAD)
-    if(NOT EXISTS "${TEN_VAD_ROOT}/include/ten_vad.h")
-        message(FATAL_ERROR "VOICE_TEST_ENABLE_VAD: ten_vad.h not found under TEN_VAD_ROOT=${TEN_VAD_ROOT}")
+    if(NOT EXISTS "${TEN_VAD_GGML_ROOT}/cpp/CMakeLists.txt")
+        message(FATAL_ERROR "VOICE_TEST_ENABLE_VAD: TEN-VAD-GGML.cpp not found under TEN_VAD_GGML_ROOT=${TEN_VAD_GGML_ROOT}")
     endif()
+
+    set(TEN_VAD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(TEN_VAD_BUILD_CLI   OFF CACHE BOOL "" FORCE)
+    add_subdirectory(${TEN_VAD_GGML_ROOT}/cpp ${CMAKE_BINARY_DIR}/ten-vad-ggml EXCLUDE_FROM_ALL)
 
     target_sources(voice_test PRIVATE src/vad_test.cpp)
-    target_include_directories(voice_test PRIVATE ${TEN_VAD_ROOT}/include)
-
-    if(WIN32)
-        if(NOT EXISTS "${TEN_VAD_ROOT}/lib/ten_vad.lib")
-            message(FATAL_ERROR "VOICE_TEST_ENABLE_VAD: ten_vad.lib not found under ${TEN_VAD_ROOT}/lib")
-        endif()
-        target_link_libraries(voice_test PRIVATE ${TEN_VAD_ROOT}/lib/ten_vad.lib)
-        # Copy the self-contained DLL next to the executable so it loads at runtime.
-        set(_ten_vad_dll "${TEN_VAD_ROOT}/lib/ten_vad.dll")
-        add_custom_command(TARGET voice_test POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${_ten_vad_dll}" "$<TARGET_FILE_DIR:voice_test>")
-    else()
-        if(NOT EXISTS "${TEN_VAD_ROOT}/lib/libten_vad.so")
-            message(FATAL_ERROR "VOICE_TEST_ENABLE_VAD: libten_vad.so not found under ${TEN_VAD_ROOT}/lib")
-        endif()
-        target_link_libraries(voice_test PRIVATE ${TEN_VAD_ROOT}/lib/libten_vad.so)
-        set_target_properties(voice_test PROPERTIES
-            BUILD_RPATH "${TEN_VAD_ROOT}/lib")
-    endif()
-
+    target_include_directories(voice_test PRIVATE ${TEN_VAD_GGML_ROOT}/cpp/include)
+    target_link_libraries(voice_test PRIVATE ten_vad_ggml)
     target_compile_definitions(voice_test PRIVATE VOICE_TEST_HAS_VAD=1)
 endif()
 

@@ -27,6 +27,7 @@ bool WorldConfig::load(const std::string& path) {
     // voice.vad
     if (j.contains("voice") && j["voice"].contains("vad")) {
         auto& v = j["voice"]["vad"];
+        if (v.contains("model_path"))  vad.model_path  = v["model_path"];
         if (v.contains("threshold"))   vad.threshold   = v["threshold"];
         if (v.contains("hop_size"))    vad.hop_size    = v["hop_size"];
         if (v.contains("min_speech"))  vad.min_speech  = v["min_speech"];

@@ -68,7 +68,7 @@ bool VoicePipeline::init_models(const WorldConfig& cfg,
 
     // --- VAD ---
     auto t1 = std::chrono::steady_clock::now();
-    if (!vad_.init(cfg_.vad.threshold, cfg_.vad.hop_size,
+    if (!vad_.init(cfg_.vad.model_path, cfg_.vad.threshold, cfg_.vad.hop_size,
                    cfg_.vad.min_speech, cfg_.vad.min_silence, cfg_.vad.max_speech,
                    [this](const VadSegment& seg) { on_vad_segment_(seg); })) {
         std::fprintf(stderr, "[pipeline] VAD init failed\n");

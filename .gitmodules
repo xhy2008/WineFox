@@ -6,3 +6,6 @@
 	path = third_party/SDL3
 	url = https://github.com/libsdl-org/SDL.git
 	branch = release-3.2.10
+[submodule "third_party/ten-vad-ggml"]
+	path = third_party/ten-vad-ggml
+	url = https://github.com/xhy2008/TEN-VAD-GGML.cpp

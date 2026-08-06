@@ -1,9 +1,9 @@
 // voice-test/src/vad_test.cpp
 //
-// VAD benchmark subcommand. Wraps the official ten-vad prebuilt lib
-// (self-contained: ONNX model + onnxruntime baked into ten_vad.dll)
-// and adds a segment state machine on top, since the ten-vad C API only
-// exposes per-frame probability/flag (no min_speech / min_silence / max_speech).
+// VAD benchmark subcommand. Uses TEN-VAD-GGML.cpp (pure C++17 port of
+// ten-vad, GGML model format) and adds a segment state machine on top,
+// since the C API only exposes a per-frame speech probability
+// (no min_speech / min_silence / max_speech).
 //
 // Metrics reported:
 //   - Detected segments (start_s, end_s, dur_s)
@@ -13,7 +13,7 @@
 //   - Optional comparison vs. ground-truth reference file
 //
 // Usage:
-//   voice_test vad <wav> [--threshold 0.5] [--hop 256]
+//   voice_test vad <wav> [--model <ten-vad-ggml.bin>] [--threshold 0.5] [--hop 256]
 //                        [--min-speech 0.25] [--min-silence 0.30]
 //                        [--max-speech 30.0]
 //                        [--reference <vad_reference.txt>]
@@ -32,7 +32,7 @@
 #include <string>
 #include <vector>
 
-#include "ten_vad.h"
+#include "ten_vad/ten_vad.h"
 
 #include "common.h"
 
@@ -43,6 +43,7 @@ namespace {
 // ---------------------------------------------------------------------------
 struct VadArgs {
     std::string wav_path;
+    std::string model_path = "models/vad/ten-vad-ggml.bin";
     std::string reference_path;   // optional ground-truth file
     std::string out_path;         // optional output file
     float  threshold       = 0.5f;
@@ -67,7 +68,8 @@ bool parse_args(const std::vector<std::string>& args, VadArgs& out) {
             }
             return args[++i];
         };
-        if (a == "--threshold")        out.threshold      = std::stof(next("--threshold"));
+        if (a == "--model")          out.model_path      = next("--model");
+        else if (a == "--threshold") out.threshold      = std::stof(next("--threshold"));
         else if (a == "--hop")         out.hop_size       = std::stoi(next("--hop"));
         else if (a == "--min-speech")  out.min_speech_s   = std::stof(next("--min-speech"));
         else if (a == "--min-silence") out.min_silence_s  = std::stof(next("--min-silence"));
@@ -89,8 +91,9 @@ bool parse_args(const std::vector<std::string>& args, VadArgs& out) {
 // ---------------------------------------------------------------------------
 // Segment state machine
 //
-// ten-vad only emits a per-frame binary flag. We wrap it with a small state
-// machine that consolidates frames into speech segments using configurable
+// ten-vad-ggml emits a per-frame speech probability; we threshold it into a
+// binary flag, then wrap it with a small state machine that consolidates
+// frames into speech segments using configurable
 // min_speech_duration / min_silence_duration / max_speech_duration, matching
 // the conventions used by sherpa-onnx / webrtc-vad style front-ends.
 // ---------------------------------------------------------------------------
@@ -282,7 +285,7 @@ int run_vad(const std::vector<std::string>& args) {
     const int max_speech_frames  = std::max(min_speech_frames, int(va.max_speech_s / frame_dur_s + 0.5));
 
     std::printf("voice_test vad\n");
-    std::printf("  ten-vad version : %s\n", ten_vad_get_version());
+    std::printf("  vad model       : %s\n", va.model_path.c_str());
     std::printf("  input           : %s\n", va.wav_path.c_str());
     std::printf("  sample_rate     : %d\n", pcm.sample_rate);
     std::printf("  num_samples     : %lld (%.3fs)\n",
@@ -295,10 +298,10 @@ int run_vad(const std::vector<std::string>& args) {
     std::printf("  total_frames    : %d\n", n_frames);
     std::printf("\n");
 
-    // Initialize ten-vad.
-    ten_vad_handle_t handle = nullptr;
-    if (ten_vad_create(&handle, size_t(hop), va.threshold) != 0 || !handle) {
-        std::fprintf(stderr, "vad: ten_vad_create failed\n");
+    // Initialize ten-vad (TEN-VAD-GGML).
+    ten_vad_ctx* handle = ten_vad_create(va.model_path.c_str());
+    if (!handle) {
+        std::fprintf(stderr, "vad: ten_vad_create failed (model=%s)\n", va.model_path.c_str());
         return 1;
     }
 
@@ -320,14 +323,9 @@ int run_vad(const std::vector<std::string>& args) {
             std::memset(frame_buf.data() + copy, 0, size_t(hop - copy) * sizeof(int16_t));
         }
 
-        float prob = 0.0f;
-        int   flag = 0;
         auto t0 = std::chrono::steady_clock::now();
-        if (ten_vad_process(handle, frame_buf.data(), size_t(hop), &prob, &flag) != 0) {
-            std::fprintf(stderr, "vad: ten_vad_process failed at frame %d\n", i);
-            ten_vad_destroy(&handle);
-            return 1;
-        }
+        float prob = ten_vad_process(handle, frame_buf.data(), size_t(hop));
+        int   flag = (prob >= va.threshold) ? 1 : 0;
         auto t1 = std::chrono::steady_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         frame_ms.push_back(ms);
@@ -335,7 +333,7 @@ int run_vad(const std::vector<std::string>& args) {
     }
     seg.finish();
     auto t_total_end = std::chrono::steady_clock::now();
-    ten_vad_destroy(&handle);
+    ten_vad_destroy(handle);
 
     const double total_proc_ms = std::chrono::duration<double, std::milli>(t_total_end - t_total_start).count();
     const double total_proc_s  = total_proc_ms / 1000.0;

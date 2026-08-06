@@ -13,6 +13,7 @@ namespace world {
 struct WorldConfig {
     // --- VAD ---
     struct Vad {
+        std::string model_path;     // ten-vad-ggml.bin path
         float threshold      = 0.5f;
         int   hop_size       = 256;    // samples per frame (16ms @ 16kHz)
         float min_speech     = 0.25f;  // seconds

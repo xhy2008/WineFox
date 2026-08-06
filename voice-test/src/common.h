@@ -20,7 +20,7 @@
 
 // 16 kHz mono int16 PCM is the canonical format across VAD/ASR/TTS.
 inline constexpr int kSampleRate = 16000;
-inline constexpr int kHopSize    = 256;  // ten-vad recommended hop (16ms)
+inline constexpr int kHopSize    = 256;  // ten-vad-ggml fixed hop (16ms)
 
 // Loaded WAV file (16-bit mono PCM; resampled to 16kHz by caller if needed).
 struct Pcm {

@@ -36,12 +36,14 @@ CMakeUserPresets.json
 
 # Build artifacts
 /voice-test/build/
+/voice-test/build-voice-test/
 
 # ONNX / GGUF / .bin model weights — large, downloaded via scripts/
 /voice-test/models/
 
 # Pre-built ONNX Runtime binary (re-download via CMake fetch)
 /voice-test/third_party/onnxruntime-prebuilt/
+/voice-test/third_party/onnxruntime-static/
 
 # Generated test artifacts (wav dumps, feature json, etc.)
 /voice-test/*.wav

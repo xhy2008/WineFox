@@ -43,9 +43,9 @@ set(_voice_root "${CMAKE_SOURCE_DIR}/voice-test/third_party")
 set(SENSEVOICE_ROOT "${_voice_root}/sensevoice-cpp")
 set(KOKORO_SRC_ROOT  "${_voice_root}/kokoro-cpp-src")
 set(ONNXRUNTIME_ROOT "${_voice_root}/onnxruntime-static")
-set(TEN_VAD_ROOT     "${_voice_root}/ten-vad")
+set(TEN_VAD_GGML_ROOT "${CMAKE_SOURCE_DIR}/third_party/ten-vad-ggml")
 
-foreach(_d SENSEVOICE_ROOT KOKORO_SRC_ROOT ONNXRUNTIME_ROOT TEN_VAD_ROOT)
+foreach(_d SENSEVOICE_ROOT KOKORO_SRC_ROOT ONNXRUNTIME_ROOT TEN_VAD_GGML_ROOT)
     if(NOT EXISTS "${${_d}}")
         message(FATAL_ERROR "${_d} not found: ${${_d}}")
     endif()
@@ -77,6 +77,13 @@ set(SENSE_VOICE_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 set(SENSE_VOICE_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
 set(GGML_BLAS                  OFF CACHE BOOL "" FORCE)
 add_subdirectory(${SENSEVOICE_ROOT} ${CMAKE_BINARY_DIR}/sensevoice-cpp EXCLUDE_FROM_ALL)
+
+# ---------------------------------------------------------------------------
+# TEN-VAD-GGML (pure C++17 VAD, no onnxruntime dependency)
+# ---------------------------------------------------------------------------
+set(TEN_VAD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(TEN_VAD_BUILD_CLI   OFF CACHE BOOL "" FORCE)
+add_subdirectory(${TEN_VAD_GGML_ROOT}/cpp ${CMAKE_BINARY_DIR}/ten-vad-ggml EXCLUDE_FROM_ALL)
 
 # ---------------------------------------------------------------------------
 # winefox_world executable
@@ -114,7 +121,6 @@ target_include_directories(winefox_world PRIVATE
     ${KOKORO_SRC_ROOT}/third_party/cppjieba/include
     ${KOKORO_SRC_ROOT}/third_party/cppjieba/deps/limonp/include
     ${ONNXRUNTIME_ROOT}/include
-    ${TEN_VAD_ROOT}/include
 )
 
 # --- winefox_core.dll (C ABI) ---
@@ -147,10 +153,8 @@ if(WIN32)
     )
 endif()
 
-# --- ten-vad (VAD, self-contained prebuilt) ---
-if(WIN32)
-    target_link_libraries(winefox_world PRIVATE ${TEN_VAD_ROOT}/lib/ten_vad.lib)
-endif()
+# --- ten-vad-ggml (static, pure C++17) ---
+target_link_libraries(winefox_world PRIVATE ten_vad_ggml)
 
 # --- Windows system libs ---
 if(WIN32)
@@ -173,14 +177,6 @@ set(_out_dir "$<TARGET_FILE_DIR:winefox_world>")
 add_custom_command(TARGET winefox_world POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_core_dll}" "${_out_dir}"
     COMMENT "Copying winefox_core.dll")
-
-# ten_vad.dll (self-contained)
-if(EXISTS "${TEN_VAD_ROOT}/lib/ten_vad.dll")
-    add_custom_command(TARGET winefox_world POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${TEN_VAD_ROOT}/lib/ten_vad.dll" "${_out_dir}"
-        COMMENT "Copying ten_vad.dll")
-endif()
 
 # Kokoro dict/ (jieba, pinyin, cmudict, vocab)
 add_custom_command(TARGET winefox_world POST_BUILD

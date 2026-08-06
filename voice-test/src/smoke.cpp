@@ -129,7 +129,7 @@ int run_smoke(const std::vector<std::string>& args) {
     std::printf("  VAD hop size            : %d samples (%.2f ms)\n",
                 kHopSize, double(kHopSize) / kSampleRate * 1000.0);
 #if defined(VOICE_TEST_HAS_VAD)
-    std::printf("  VAD    : ENABLED  (ten-vad + onnxruntime)\n");
+    std::printf("  VAD    : ENABLED  (ten-vad-ggml)\n");
 #else
     std::printf("  VAD    : disabled (build with -DVOICE_TEST_ENABLE_VAD=ON)\n");
 #endif

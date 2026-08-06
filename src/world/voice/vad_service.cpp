@@ -1,7 +1,7 @@
-// vad_service.cpp — Voice Activity Detection service (ten-vad + segmenter).
+// vad_service.cpp — Voice Activity Detection service (ten-vad-ggml + segmenter).
 //
-// Implementation of VadService declared in vad_service.h. Wraps the official
-// ten-vad prebuilt lib (self-contained ONNX + onnxruntime) and ports the
+// Implementation of VadService declared in vad_service.h. Wraps the pure C++17
+// ten-vad-ggml library (no onnxruntime, no external DLL) and ports the
 // segmenter state machine from voice-test/src/vad_test.cpp (Segmenter struct)
 // to a streaming incremental-audio model.
 //
@@ -12,7 +12,7 @@
 // speech range [confirmed_start_, last_speech_frame_+1) on finalization.
 
 #include "vad_service.h"
-#include "ten_vad.h"
+#include "ten_vad/ten_vad.h"
 
 #include <algorithm>
 #include <utility>
@@ -20,21 +20,22 @@
 namespace winefox {
 namespace world {
 
-bool VadService::init(float threshold, int hop_size,
+bool VadService::init(const std::string& model_path,
+                      float threshold, int hop_size,
                       float min_speech_s, float min_silence_s, float max_speech_s,
                       SegmentCallback on_segment) {
     // Release any previously created handle before re-creating.
     if (handle_) {
-        ten_vad_destroy(&handle_);
+        ten_vad_destroy((ten_vad_ctx*)handle_);
         handle_ = nullptr;
     }
 
     hop_size_ = hop_size;
+    threshold_ = threshold;
     on_segment_ = std::move(on_segment);
 
-    if (ten_vad_create(&handle_, static_cast<size_t>(hop_size), threshold) != 0 ||
-        !handle_) {
-        handle_ = nullptr;
+    handle_ = ten_vad_create(model_path.c_str());
+    if (!handle_) {
         return false;
     }
 
@@ -63,7 +64,7 @@ bool VadService::init(float threshold, int hop_size,
 
 VadService::~VadService() {
     if (handle_) {
-        ten_vad_destroy(&handle_);
+        ten_vad_destroy((ten_vad_ctx*)handle_);
         handle_ = nullptr;
     }
 }
@@ -71,12 +72,11 @@ VadService::~VadService() {
 void VadService::feed(const int16_t* samples, int n) {
     if (!handle_ || n <= 0) return;
 
-    float prob = 0.0f;
-    int   flag = 0;
-    if (ten_vad_process(handle_, samples, static_cast<size_t>(n),
-                        &prob, &flag) != 0) {
-        return;
-    }
+    // ten-vad-ggml returns probability [0,1]; we compare against threshold
+    // to derive the binary speech/silence flag.
+    float prob = ten_vad_process((ten_vad_ctx*)handle_, samples,
+                                 static_cast<size_t>(n));
+    int flag = (prob >= threshold_) ? 1 : 0;
 
     // Finalize and emit the current segment. Trims any trailing silence
     // frames accumulated after last_speech_frame_ so the emitted audio spans
@@ -204,7 +204,10 @@ void VadService::flush() {
 
 void VadService::reset() {
     // Hard reset of the segmenter state machine — no segment is emitted.
-    // The ten-vad handle is left intact (used for hard interrupt).
+    // Also reset the VAD model's internal LSTM state for a clean restart.
+    if (handle_) {
+        ten_vad_reset((ten_vad_ctx*)handle_);
+    }
     state_ = State::SILENCE;
     pending_start_frame_ = 0;
     confirmed_start_ = 0;
