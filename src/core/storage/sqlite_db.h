@@ -13,6 +13,19 @@
 namespace winefox {
 namespace storage {
 
+// A single bind parameter. Set is_blob=true when `data` holds raw binary
+// (e.g. an embedding vector); it is then bound with sqlite3_bind_blob so the
+// value is stored/retrieved as BLOB instead of being truncated at the first
+// null byte like sqlite3_bind_text would.
+struct SqliteParam {
+    std::string data;
+    bool        is_blob = false;
+
+    SqliteParam() = default;
+    SqliteParam(const std::string& d, bool blob = false) : data(d), is_blob(blob) {}
+    SqliteParam(const char* d, bool blob = false) : data(d ? d : ""), is_blob(blob) {}
+};
+
 class SqliteDb {
 public:
     SqliteDb() = default;
@@ -31,17 +44,18 @@ public:
     // Returns false on error and writes the SQLite message to `err` if present.
     bool exec(const std::string& sql, std::string* err = nullptr);
 
-    // Run a parameterised query. `params` are bound by position (1-based).
+    // Run a parameterised query. `params` are bound by position (1-based);
+    // a param with is_blob=true is bound as raw binary (BLOB).
     // `cb` is invoked for each row; returning false stops iteration.
     // Returns false on prepare/step error.
     using RowCallback = std::function<bool(sqlite3_stmt*)>;
     bool query(const std::string& sql,
-               const std::vector<std::string>& params,
+               const std::vector<SqliteParam>& params,
                RowCallback cb);
 
     // Convenience for a single INSERT/UPDATE returning last_insert_rowid().
     // Returns -1 on failure.
-    long long insert(const std::string& sql, const std::vector<std::string>& params);
+    long long insert(const std::string& sql, const std::vector<SqliteParam>& params);
 
     sqlite3* handle() { return db_; }
     bool is_open() const { return db_ != nullptr; }

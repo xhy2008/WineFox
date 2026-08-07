@@ -1,3 +1,0 @@
-/image E:\winefox\tests\test_red.png
-这是什么颜色？
-/quit

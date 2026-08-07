@@ -158,6 +158,20 @@ if(WINEFOX_BUILD_CLI AND WINEFOX_CORE_SOURCES_AND_HEADERS_EXIST)
 endif()
 
 # ---------------------------------------------------------------------------
+# winefox_memory_import: pre-seed the memory DB from the SFT dataset
+# ---------------------------------------------------------------------------
+# Requires static winefox_core (C++ symbols); not available in the world
+# CORE_DLL build where only the C ABI is exported.
+if(WINEFOX_BUILD_CLI AND WINEFOX_CORE_SOURCES_AND_HEADERS_EXIST AND NOT WINEFOX_BUILD_CORE_DLL)
+    add_executable(winefox_memory_import src/app/memory_import.cpp)
+    target_link_libraries(winefox_memory_import PRIVATE winefox_core)
+    if(WIN32)
+        target_link_libraries(winefox_memory_import PRIVATE userenv)
+    endif()
+    set_target_properties(winefox_memory_import PROPERTIES OUTPUT_NAME winefox-memory-import)
+endif()
+
+# ---------------------------------------------------------------------------
 # Tests (Phase 1 MVP skips these; enable with -DWINEFOX_BUILD_TESTS=ON later)
 # ---------------------------------------------------------------------------
 if(WINEFOX_BUILD_TESTS)

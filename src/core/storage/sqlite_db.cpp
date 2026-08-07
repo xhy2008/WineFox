@@ -93,7 +93,7 @@ bool SqliteDb::exec(const std::string& sql, std::string* err) {
 }
 
 bool SqliteDb::query(const std::string& sql,
-                     const std::vector<std::string>& params,
+                     const std::vector<SqliteParam>& params,
                      RowCallback cb) {
     if (!db_) return false;
     sqlite3_stmt* stmt = nullptr;
@@ -102,8 +102,14 @@ bool SqliteDb::query(const std::string& sql,
         return false;
     }
     for (size_t i = 0; i < params.size(); ++i) {
-        sqlite3_bind_text(stmt, static_cast<int>(i + 1), params[i].c_str(), -1,
-                          SQLITE_TRANSIENT);
+        const auto& p = params[i];
+        if (p.is_blob) {
+            sqlite3_bind_blob(stmt, static_cast<int>(i + 1), p.data.data(),
+                              static_cast<int>(p.data.size()), SQLITE_TRANSIENT);
+        } else {
+            sqlite3_bind_text(stmt, static_cast<int>(i + 1), p.data.c_str(), -1,
+                              SQLITE_TRANSIENT);
+        }
     }
     bool ok = true;
     while (true) {
@@ -122,7 +128,7 @@ bool SqliteDb::query(const std::string& sql,
     return ok;
 }
 
-long long SqliteDb::insert(const std::string& sql, const std::vector<std::string>& params) {
+long long SqliteDb::insert(const std::string& sql, const std::vector<SqliteParam>& params) {
     if (!db_) return -1;
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
@@ -130,8 +136,14 @@ long long SqliteDb::insert(const std::string& sql, const std::vector<std::string
         return -1;
     }
     for (size_t i = 0; i < params.size(); ++i) {
-        sqlite3_bind_text(stmt, static_cast<int>(i + 1), params[i].c_str(), -1,
-                          SQLITE_TRANSIENT);
+        const auto& p = params[i];
+        if (p.is_blob) {
+            sqlite3_bind_blob(stmt, static_cast<int>(i + 1), p.data.data(),
+                              static_cast<int>(p.data.size()), SQLITE_TRANSIENT);
+        } else {
+            sqlite3_bind_text(stmt, static_cast<int>(i + 1), p.data.c_str(), -1,
+                              SQLITE_TRANSIENT);
+        }
     }
     long long rowid = -1;
     int rc = sqlite3_step(stmt);

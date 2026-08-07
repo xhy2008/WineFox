@@ -59,7 +59,6 @@ struct RecallFile {
     int                    recall_count = 0;
 
     std::vector<RecallSegment>      segments;
-    std::vector<std::string>       resources;   // resource_path list
 };
 
 // A single recall hit returned to the conversation manager.

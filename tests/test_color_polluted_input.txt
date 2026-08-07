@@ -1,6 +1,0 @@
-/reset
-酒狐你的头发是什么颜色的？
-酒狐你最喜欢什么颜色？
-/image E:\winefox\tests\test_red.png
-这是什么颜色？
-/quit

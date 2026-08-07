@@ -53,11 +53,9 @@ assistant:{..........................}
 
 ### VAD
 
-使用项目:https://github.com/TEN-framework/ten-vad
+使用项目:https://github.com/xhy2008/TEN-VAD-GGML.cpp
 
-原版TEN-VAD使用ONNX推理，无需特殊优化。
-
-后期为了增强与ASR的协作能力可能会考虑参考https://github.com/danielbodart/ten-vad-ggml移植到ggml后端
+我自己对TEN-VAD的C++移植，参考https://github.com/danielbodart/ten-vad-ggml
 
 ### TTS
 

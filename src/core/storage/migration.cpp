@@ -45,14 +45,6 @@ CREATE TABLE IF NOT EXISTS recall_segments (
 CREATE INDEX IF NOT EXISTS idx_recall_segments_file
     ON recall_segments(recall_file_id);
 
-CREATE TABLE IF NOT EXISTS recall_file_resources (
-    recall_file_id INTEGER NOT NULL,
-    resource_path  TEXT NOT NULL,
-    resource_type  TEXT,
-    PRIMARY KEY (recall_file_id, resource_path),
-    FOREIGN KEY (recall_file_id) REFERENCES recall_files(id) ON DELETE CASCADE
-);
-
 CREATE TABLE IF NOT EXISTS raw_messages (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     role       TEXT NOT NULL,

@@ -4,6 +4,7 @@
 #include "../util/time.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace winefox {
@@ -18,6 +19,7 @@ struct SegmentHit {
     std::string            content;
     std::vector<float>     embedding;
     int64_t                created_at;
+    int                    recall_count = 0;   // 该记忆文件被命中的次数
     float                  score;
 };
 
@@ -64,8 +66,9 @@ std::vector<Recall> RecallService::recall(const std::string& query, int top_k) {
     // that a linear scan is fine; revisit with an ANN index once it matters.
     std::vector<SegmentHit> hits;
     db_->query(
-        "SELECT id, recall_file_id, content, embedding, created_at "
-        "FROM recall_segments",
+        "SELECT s.id, s.recall_file_id, s.content, s.embedding, s.created_at, "
+        "       f.recall_count "
+        "FROM recall_segments s JOIN recall_files f ON f.id = s.recall_file_id",
         {},
         [&](sqlite3_stmt* stmt) {
             SegmentHit h;
@@ -78,47 +81,58 @@ std::vector<Recall> RecallService::recall(const std::string& query, int top_k) {
                 h.embedding = decode_embedding_(
                     std::string(static_cast<const char*>(blob), blob_sz));
             }
-            h.created_at = sqlite3_column_int64(stmt, 4);
-            h.score      = cosine_(q, h.embedding);
+            h.created_at   = sqlite3_column_int64(stmt, 4);
+            h.recall_count = sqlite3_column_int(stmt, 5);
+            h.score        = cosine_(q, h.embedding);
             hits.push_back(std::move(h));
             return true;
         });
 
     if (hits.empty()) return out;
 
+    // 最终得分 = 0.7×相似度 + 0.3×新鲜度。
+    // 新鲜度 = 0.5×“距今绝对时间”衰减 + 0.5×“召回次数”饱和值，让相似但
+    // 很久没用的记忆不会被完全淹没，同时常被命中的记忆获得一定加成。
+    const double kAgeTauSec    = 30.0 * 24 * 3600;  // 30 天时间常数，半衰期约 21 天
+    const double kRecallSatur  = 3.0;               // 召回 3 次时召回分量达到 0.5
+    constexpr float kSimW    = 0.7f;
+    constexpr float kFreshW  = 0.3f;
+    constexpr float kAgeW    = 0.5f;
+    constexpr float kRecallW = 0.5f;
+
+    int64_t now = winefox::time::now_ms() / 1000;
+    for (auto& h : hits) {
+        // 距今绝对时间（秒）：新记忆 → 1，越旧越接近 0。
+        int64_t age = std::max<int64_t>(0, now - h.created_at);
+        double age_score = std::exp(-static_cast<double>(age) / kAgeTauSec);
+        // 召回次数：饱和函数，命中越多越“热”。
+        double recall_score = static_cast<double>(h.recall_count) /
+                              (static_cast<double>(h.recall_count) + kRecallSatur);
+        double freshness = kAgeW * age_score + kRecallW * recall_score;
+        h.score = kSimW * h.score + kFreshW * static_cast<float>(freshness);
+    }
+
     std::sort(hits.begin(), hits.end(),
               [](const SegmentHit& a, const SegmentHit& b) { return a.score > b.score; });
-
-    // Time-decay: blend similarity with recency so stale-but-similar memories
-    // do not completely drown out fresher ones. decay = 0.7*sim + 0.3*recency.
-    int64_t now = winefox::time::now_ms() / 1000;
-    int64_t newest = 0, oldest = 0;
-    for (const auto& h : hits) {
-        if (newest == 0 || h.created_at > newest) newest = h.created_at;
-        if (oldest == 0 || h.created_at < oldest) oldest = h.created_at;
-    }
-    int64_t span = (newest > oldest) ? (newest - oldest) : 1;
 
     // Take top_k * 2 candidates before aggregation, then aggregate by file_id.
     int cand = std::min<int>(static_cast<int>(hits.size()), std::max(top_k * 2, top_k));
     std::map<long long, Recall> by_file;
     for (int i = 0; i < cand; ++i) {
         const auto& h = hits[i];
-        float recency = static_cast<float>(h.created_at - oldest) / span;
-        float blended = 0.7f * h.score + 0.3f * recency;
 
         auto it = by_file.find(h.file_id);
         if (it == by_file.end()) {
             Recall r;
             r.file_id    = h.file_id;
             r.content    = h.content;
-            r.score      = blended;
+            r.score      = h.score;
             r.created_at = h.created_at;
             by_file[h.file_id] = std::move(r);
         } else {
             // Aggregate: append content, keep max score.
             it->second.content += "\n" + h.content;
-            if (blended > it->second.score) it->second.score = blended;
+            if (h.score > it->second.score) it->second.score = h.score;
         }
     }
 
@@ -159,7 +173,9 @@ long long RecallService::commit_recall_file(const RecallFile& file) {
     long long file_id = db_->insert(
         "INSERT INTO recall_files(title, content, summary, embedding, created_at) "
         "VALUES(?,?,?,?,?)",
-        {file.title, file.content, file.summary, file_emb_blob, now_str});
+        {storage::SqliteParam{file.title}, storage::SqliteParam{file.content},
+         storage::SqliteParam{file.summary},
+         storage::SqliteParam{file_emb_blob, true}, storage::SqliteParam{now_str}});
     if (file_id < 0) {
         db_->exec("ROLLBACK");
         return -1;
@@ -170,13 +186,8 @@ long long RecallService::commit_recall_file(const RecallFile& file) {
         db_->insert(
             "INSERT INTO recall_segments(recall_file_id, content, embedding, created_at) "
             "VALUES(?,?,?,?)",
-            {std::to_string(file_id), s.content, seg_emb, now_str});
-    }
-    for (const auto& res : file.resources) {
-        db_->insert(
-            "INSERT OR IGNORE INTO recall_file_resources(recall_file_id, resource_path, resource_type) "
-            "VALUES(?,?,?)",
-            {std::to_string(file_id), res, ""});
+            {storage::SqliteParam{std::to_string(file_id)}, storage::SqliteParam{s.content},
+             storage::SqliteParam{seg_emb, true}, storage::SqliteParam{now_str}});
     }
     db_->exec("COMMIT");
     WF_LOG_INFO("Recall: committed file %lld (%zu segments)", file_id, file.segments.size());

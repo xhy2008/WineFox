@@ -22,13 +22,13 @@
 
 - [x] llama.cpp：git submodule 接入 `third_party/llama.cpp`（pinned to release tag b10069），CMake `add_subdirectory`，验证 Windows x64 Release 构建
 - [x] **LLAMA_BUILD_COMMON=ON**：链接 `llama-common` 库（为使用 `common_chat_templates_apply` 支持 `enable_thinking=false`，等价 `llama-cli -rea off`，从源头禁止 Qwen3.5 生成 `<think>` 块）
-- [x] **新架构**：抛弃 sherpa-onnx 中间层，改为双后端直连：
-  - VAD：ten-vad 官方预编译库（**自包含**：ONNX 模型 + onnxruntime 已嵌入 `ten_vad.dll`，无需单独 onnxruntime）
+- [x] **新架构**：抛弃 sherpa-onnx 中间层，改为后端直连：
+  - VAD：TEN-VAD-GGML.cpp（纯 C++17 移植，GGML 模型格式，零外部依赖，无 onnxruntime）
   - ASR：SenseVoice.cpp（ggml 后端，与 llama.cpp 共享 ggml）
   - TTS：Kokoro ONNX + kokoro.cpp 的 G2P 前端（onnxruntime 后端，Phase 3 接入）
   - 详见 `voice-test/README.md`
-- [x] onnxruntime：预编译包已接入 `voice-test/third_party/onnxruntime-prebuilt/`（Win x64，**仅 TTS 使用**，VAD 自包含）。Android arm64-v8a 待 Phase 6 接入。
-- [x] ten-vad：下载预编译库到 `voice-test/third_party/ten-vad/`（Win x64：`ten_vad.dll` 510KB + `ten_vad.lib` + `ten_vad.h`，自包含 onnxruntime + ONNX 模型）。Android arm64-v8a 待 Phase 6 接入。
+- [x] onnxruntime：预编译包已接入 `voice-test/third_party/onnxruntime-static/`（Win x64，**仅 TTS 使用**）。Android arm64-v8a 待 Phase 6 接入。
+- [x] ten-vad-ggml：git submodule 接入 `third_party/ten-vad-ggml`（`https://github.com/xhy2008/TEN-VAD-GGML.cpp`，纯 C++17，自带 1024 点 FFT，峰值内存 5.5MB，加载 4ms，RTF 0.011）。**已删除旧 ONNX 预编译库** `voice-test/third_party/ten-vad/`（ten_vad.dll 510KB 自包含 onnxruntime 方案弃用）
 - [x] SenseVoice.cpp：git submodule 接入 `voice-test/third_party/sensevoice-cpp`（自带 ggml，voice-test 独立构建，避免与 llama.cpp 的 ggml target 冲突）
 - [x] kokoro.cpp：vendor 其 G2P 前端代码（ZHFrontend/ZHG2P/ToneSandhi/JiebaProcessor/EnG2P/Tokenizer）到 `voice-test/third_party/kokoro-cpp-src/`
 - [ ] webrtc-apm：克隆 WebRTC 源码，提取 AEC3 模块到 `third_party/webrtc-apm`（Phase 3 用，本阶段仅占位）
@@ -42,7 +42,7 @@
 - [x] 下载 `Qwen3.5-0.8B-Instruct-Q4_0.gguf` 作为默认基座（注：Q4_0 量化出现严重幻觉，弃用；FP16 测试通过；**Q8_0 量化已切换**，生成速度 17.3 tok/s，CPU_REPACK 优化生效）
 - [x] 下载 `bge-small-zh-v1.5-Q8_0.gguf` 作为默认 embedding 模型
 - [x] 下载 SenseVoice-Small INT8 ONNX 模型到 `models/asr/`
-- [x] 下载 TEN-VAD ONNX 模型到 `models/vad/`
+- [x] 下载 TEN-VAD 模型到 `models/vad/`（ONNX 版已弃用删除，改用 GGML 格式 `ten-vad-ggml.bin`）
 - [x] 验证 `models/winefox-lora-f16.gguf` 与新基座的兼容性（LoRA 层名匹配）
 
 ### 0.4 基础工具模块
@@ -206,16 +206,16 @@
 ### 2.2 VAD 服务
 
 - [x] **voice-test VAD 基准测试已通过**（`voice-test/src/vad_test.cpp`）：
-  - ten-vad 2.1.0 预编译库（自包含，无需 onnxruntime）
+  - TEN-VAD-GGML.cpp 纯 C++17 移植（GGML 模型，零外部依赖，加载 4ms）
   - 段状态机：hop=256 (16ms), min_speech=250ms, min_silence=300ms, max_speech=30s
-  - 性能：RTF=0.0112 (~89x realtime), avg 0.179ms/frame, p95 0.252ms
-  - 准确度：3/3 段检测正确，segment-level F1=1.0，frame-level F1=0.77（threshold=0.3）
+  - 性能：RTF=0.011 (~89x realtime)，峰值内存 5.5MB，avg 0.21ms/frame
+  - 模型：`models/vad/ten-vad-ggml.bin`（GGML 格式，302KB）
   - 详见 `voice-test/README.md` Phase 1 VAD benchmark summary
-- [ ] `src/core/vad/vad_service.h/cpp`：将 voice-test 中的状态机迁移为生产服务
-  - 调用 ten-vad 官方 C API（`ten_vad_create` / `ten_vad_process`）
-  - 自实现段状态机：frame_size=10ms, min_speech_duration=250ms, min_silence_duration=300ms
-  - `on_speech_segment(cb)` 流式回调语音段
-  - `on_interrupt(cb)` 用户开始说话时触发（用于打断 TTS/LLM）
+- [x] **VadService 已迁移到 winefox_world**（`src/world/voice/vad_service.h/cpp`）：
+  - 调用 ten-vad-ggml C API（`ten_vad_create(model_path)` / `ten_vad_process` 返回概率 / `ten_vad_reset`）
+  - 自实现段状态机：hop=256, min_speech=250ms, min_silence=300ms
+  - `on_segment` 流式回调语音段；`feed()` 概率 ≥ threshold 判定 speech
+  - 模型路径来自 winefox.json `voice.vad.model_path`（WorldConfig 解析）
 - [ ] 单元测试：喂入静音/语音混合音频，端点检测正确
 
 ### 2.3 ASR 服务
@@ -251,7 +251,7 @@
 ### 2.5 流式管线调度器
 
 - [x] **voice-test Stream 基准测试已通过**（`voice-test/src/stream_test.cpp`）：
-  - VAD (ten-vad) + ASR (SenseVoice.cpp) 流式管线，段状态机驱动
+  - VAD (ten-vad-ggml) + ASR (SenseVoice.cpp) 流式管线，段状态机驱动
   - 3/3 段正确识别："你好"、"今天天气真好"、"我们去散步吧"
   - E2E 延迟：min=0.534s, avg=0.671s, p50=0.701s, p95=0.770s, max=0.777s
   - 整体 RTF=0.1333 (7.50x realtime)，9.165s 音频 1.222s 处理完
@@ -581,6 +581,7 @@
 - [x] **[已测量]** LoRA 热加载/卸载延迟：attach 约 ms 级（82.6MB LoRA），可接受，不影响记忆整理流程（对齐 [11.2.8](./PLAN.md#L926-L932)）
 - [ ] **[待决策]** CosyVoice 跨语言克隆音色是否达标，不达标时的备选方案
 - [x] **[已验证]** Qwen3.5-0.8B Q8_0 在当前开发机达到 17.3 tok/s（对比 FP16 9.0 tok/s，提速 ~92%），CPU_REPACK 优化生效，超过 8 tok/s 目标
+- [x] **[已解决]** VAD 后端迁移：TEN-VAD 从 ONNX 推理（onnxruntime 嵌入 DLL，加载数百 ms）迁移到用户自研纯 C++17 版（TEN-VAD-GGML.cpp，GGML 模型，加载 4ms，峰值内存 5.5MB，RTF 0.011）。旧 ONNX 预编译库（`voice-test/third_party/ten-vad/`）与 ONNX 模型（`models/vad/ten-vad.onnx`）已删除，voice-test 与新 VadService 均改用 `ten_vad_create(model_path)` / `ten_vad_process` 概率 API
 - [ ] **[待决策]** Windows GLES3 是用原生驱动还是强制 ANGLE
 - [x] **[已解决]** Qwen3.5 `<think>` 块过滤：通过 `LLAMA_BUILD_COMMON=ON` + `common_chat_templates_apply` 设置 `enable_thinking=false`（等价 `llama-cli -rea off`），从 jinja 模板源头禁止思考模式，模型不再生成 `<think>` 块。无需在输出流中过滤
 - [x] **[已解决]** Q4_0 量化出现严重幻觉：测试期改用 FP16，正式构建将切换 Q8_0（弃用 Q4_0）

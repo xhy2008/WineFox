@@ -151,7 +151,7 @@ TTS 首音块:         150-400 ms
 | Embedding Qwen3-Embedding-0.6B Q8 | 600 | - |
 | ASR SenseVoice-Small INT8 | 450 | - |
 | TTS VITS-Tiny (蒸馏后, INT8) | 80 | - |
-| VAD TEN-VAD | 20 | - |
+| VAD ten-vad-ggml | 6 | - |
 | AEC3 状态 | 10 | - |
 | 主程序 + SQLite + UI | 200 | - |
 | **合计常驻（默认档）** | **~1430 MB** | - |
@@ -228,16 +228,17 @@ TTS 首音块:         150-400 ms
 │  后端层                                                  │
 │  - llama.cpp (LLM + Embedding)         [ggml]           │
 │  - SenseVoice.cpp (ASR)                [ggml]           │
-│  - ten-vad (VAD)                       [onnxruntime]    │
+│  - ten-vad-ggml (VAD)                  [纯 C++17/GGML] │
 │  - Kokoro (TTS)                        [onnxruntime]    │
 │  - webrtc-audio-processing (AEC3)                       │
 │  - SQLite3 (存储)                                       │
 └─────────────────────────────────────────────────────────┘
 ```
 
-> **架构演进**：原方案用 sherpa-onnx 统一封装 ASR/VAD/TTS，现改为双后端直连：
+> **架构演进**：原方案用 sherpa-onnx 统一封装 ASR/VAD/TTS，现改为后端直连：
 > - **ggml 后端**：llama.cpp (LLM) + SenseVoice.cpp (ASR) 共享 `ggml.dll`
-> - **onnxruntime 后端**：ten-vad (VAD) + Kokoro (TTS) 共享 `onnxruntime.dll`
+> - **纯 C++17**：ten-vad-ggml (VAD) 零依赖（自带 FFT，GGML 模型，无 onnxruntime）
+> - **onnxruntime 后端**：Kokoro (TTS)（VAD 迁移后 onnxruntime 仅 TTS 使用）
 > - 最终可拆为 `ggml.dll` / `llm.dll` / `sensevoice.dll` / `vad.dll` / `tts.dll` 运行时动态链接
 > - 详见 `voice-test/README.md`
 
@@ -252,7 +253,7 @@ winefox/
 │   │   ├── llm/                  # LLM 服务（封装 llama.cpp, ggml）
 │   │   ├── asr/                  # ASR 服务（封装 SenseVoice.cpp, ggml）
 │   │   ├── tts/                  # TTS 服务（封装 Kokoro, onnxruntime）
-│   │   ├── vad/                  # VAD 服务（封装 ten-vad, onnxruntime）
+│   │   ├── vad/                  # VAD 服务（封装 ten-vad-ggml, 纯 C++17；实际位于 src/world/voice/vad_service.*）
 │   │   ├── aec/                  # AEC 服务
 │   │   ├── memory/               # 记忆服务（短期 + 长期）
 │   │   ├── embedder/             # 向量嵌入
@@ -293,8 +294,8 @@ winefox/
 ├── third_party/
 │   ├── llama.cpp/                # git submodule (ggml + LLM)
 │   ├── sensevoice-cpp/           # git submodule (ggml ASR)
-│   ├── onnxruntime/              # prebuilt package (VAD + TTS backend)
-│   ├── ten-vad/                  # prebuilt lib (VAD)
+│   ├── ten-vad-ggml/             # git submodule (纯 C++17 VAD, GGML 模型)
+│   ├── onnxruntime/              # prebuilt package (仅 TTS 后端)
 │   ├── kokoro-cpp/               # vendored G2P frontend (TTS)
 │   ├── webrtc-apm/               # AEC3 提取模块
 │   ├── SDL3/                     # FetchContent (窗口/输入/音频)
@@ -500,7 +501,7 @@ public:
 ```
 
 **实现要点**：
-- **VAD**：TEN-VAD，frame_size=10ms，min_speech_duration=250ms，min_silence_duration=300ms（可动态调整）。
+- **VAD**：TEN-VAD-GGML.cpp（纯 C++17，GGML 模型），hop=256 (16ms)，min_speech_duration=250ms，min_silence_duration=300ms（可动态调整）。
 - **AEC3**：仅在内置扬声器路由时启用，耳机时跳过。
 - **ASR**：SenseVoice-Small（INT8 ONNX），支持流式（partial + final）。
 - **打断逻辑**：VAD 触发 speech 时立即停止 TTS 播放和 LLM 生成。
@@ -982,7 +983,7 @@ public:
 **目标**：实现实时语音对话。
 
 - [ ] AudioIo (WASAPI)
-- [ ] VadService（TEN-VAD）
+- [x] VadService（ten-vad-ggml，纯 C++17；已实现于 src/world/voice/vad_service.*）
 - [ ] AsrService（SenseVoice-Small）
 - [ ] TtsService（Kokoro-82M 官方模型，后续蒸馏替换为酒狐音色）
 - [ ] PipelineScheduler 流式管线
@@ -1018,7 +1019,7 @@ public:
 - [x] 项目骨架（src/world/ 目录结构 + CMake 构建）
 - [x] SDL3 窗口创建（空窗口，处理关闭事件）
 - [x] 链接 winefox_core（LLM + 记忆 + ConversationManager）
-- [x] 链接语音后端（ten-vad VAD + SenseVoice ASR + Kokoro TTS）
+- [x] 链接语音后端（ten-vad-ggml VAD + SenseVoice ASR + Kokoro TTS）
 - [x] SDL_audio 麦克风输入 + 扬声器输出
 - [x] VoicePipeline：VAD→ASR→LLM→TTS 端到端语音对话
 - [x] 同进程多线程（主线程窗口，工作线程 AI 管线）
@@ -1163,7 +1164,8 @@ public:
 
 - llama.cpp: https://github.com/ggml-org/llama.cpp
 - SenseVoice.cpp (ggml ASR): https://github.com/lovemefan/SenseVoice.cpp
-- TEN-VAD (onnxruntime VAD): https://github.com/TEN-framework/ten-vad
+- TEN-VAD (原版 ONNX VAD，已弃用): https://github.com/TEN-framework/ten-vad
+- TEN-VAD-GGML.cpp (纯 C++17 VAD，正式采用): https://github.com/xhy2008/TEN-VAD-GGML.cpp
 - onnxruntime: https://github.com/microsoft/onnxruntime
 - Kokoro-82M (TTS 模型): https://huggingface.co/hexgrad/Kokoro-82M
 - kokoro.cpp (G2P 前端参考): https://github.com/koth/kokoro.cpp
@@ -1197,7 +1199,7 @@ public:
 
 #### 11.2.1 跨平台构建应进一步收敛起步范围
 
-**问题**：8 个平台组合（Win x86/x64/arm64 + Android arm64 + Linux x86/x64/arm64/arm32）的 CI 矩阵和本地验证成本极高，第三方依赖（llama.cpp、SenseVoice.cpp、onnxruntime、ten-vad、webrtc-apm）在 arm32/arm64 上的构建脚本调试可能消耗大量时间。
+**问题**：8 个平台组合（Win x86/x64/arm64 + Android arm64 + Linux x86/x64/arm64/arm32）的 CI 矩阵和本地验证成本极高，第三方依赖（llama.cpp、SenseVoice.cpp、onnxruntime、ten-vad-ggml、webrtc-apm）在 arm32/arm64 上的构建脚本调试可能消耗大量时间。
 
 **建议**：
 - Phase 1-5 仅锁定 **Windows x64 + Linux x64** 两个主开发平台。

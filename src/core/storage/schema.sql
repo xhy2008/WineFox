@@ -42,15 +42,6 @@ CREATE TABLE IF NOT EXISTS recall_segments (
 CREATE INDEX IF NOT EXISTS idx_recall_segments_file
     ON recall_segments(recall_file_id);
 
--- recall_file_resources: files mentioned in a memory (images, docs, ...).
-CREATE TABLE IF NOT EXISTS recall_file_resources (
-    recall_file_id INTEGER NOT NULL,
-    resource_path  TEXT NOT NULL,
-    resource_type  TEXT,
-    PRIMARY KEY (recall_file_id, resource_path),
-    FOREIGN KEY (recall_file_id) REFERENCES recall_files(id) ON DELETE CASCADE
-);
-
 -- raw_messages: append-only conversation log (user + assistant + emotion).
 -- Used by the distiller to reconstruct a session for summarisation.
 CREATE TABLE IF NOT EXISTS raw_messages (
