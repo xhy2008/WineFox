@@ -90,13 +90,29 @@ std::vector<Recall> RecallService::recall(const std::string& query, int top_k) {
 
     if (hits.empty()) return out;
 
-    // 最终得分 = 0.7×相似度 + 0.3×新鲜度。
-    // 新鲜度 = 0.5×“距今绝对时间”衰减 + 0.5×“召回次数”饱和值，让相似但
-    // 很久没用的记忆不会被完全淹没，同时常被命中的记忆获得一定加成。
+    // 相关度门槛：与查询的余弦相似度必须达到阈值才算“相关”。
+    // 问候/寒暄这类泛泛查询对所有记忆的相似度都很低，直接整体丢弃，
+    // 不再注入 [相关记忆]，避免无关记忆干扰生成。
+    // 校准依据（bge-large-zh-v1.5-q8_0 实测，每查询前重置 recall_count）：
+    //   相关查询   cos ≈ 0.37–0.69
+    //   问候/寒暄  cos ≈ 0.25–0.43（“晚安/晚上好/吃饭了吗”等词面与日常生活
+    //   记忆重叠者会落在 0.37–0.43，此类无法用相似度区分，只能靠词面门控）
+    // 取 0.36：保留全部相关查询，同时滤掉明确无关的低分命中。
+    constexpr float kCosMin = 0.36f;
+    hits.erase(std::remove_if(hits.begin(), hits.end(),
+                              [](const SegmentHit& h) { return h.score < kCosMin; }),
+               hits.end());
+    if (hits.empty()) return out;
+
+    // 最终得分 = 0.9×相似度 + 0.1×新鲜度。
+    // 新鲜度 = 0.5×“距今绝对时间”衰减 + 0.5×“召回次数”饱和值。
+    // 注：批量导入的记忆几乎同时写入（created_at 相近、recall_count=0），
+    // 此时新鲜度分量对所有记忆近似相同，权重过高会稀释相似度的区分度，
+    // 故相似度占主导；等运行时累积新记忆后再逐步放开。
     const double kAgeTauSec    = 30.0 * 24 * 3600;  // 30 天时间常数，半衰期约 21 天
     const double kRecallSatur  = 3.0;               // 召回 3 次时召回分量达到 0.5
-    constexpr float kSimW    = 0.7f;
-    constexpr float kFreshW  = 0.3f;
+    constexpr float kSimW    = 0.9f;
+    constexpr float kFreshW  = 0.1f;
     constexpr float kAgeW    = 0.5f;
     constexpr float kRecallW = 0.5f;
 

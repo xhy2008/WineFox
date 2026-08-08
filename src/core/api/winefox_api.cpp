@@ -39,6 +39,7 @@ struct WineFoxCore {
     std::string system_prompt;
     std::string last_emotion = "neutral";
     std::string last_reply;       // owned buffer for winefox_chat return value
+    std::string last_recall_buf;  // owned buffer for winefox_last_recall
     std::string memory_info_buf;  // owned buffer for winefox_get_memory_info
 };
 
@@ -218,6 +219,26 @@ WF_API const char* winefox_chat(WineFoxCore* c,
 
 WF_API const char* winefox_last_emotion(WineFoxCore* c) {
     return c ? c->last_emotion.c_str() : "neutral";
+}
+
+WF_API const char* winefox_last_recall(WineFoxCore* c) {
+    if (!c || !c->conv) return "";
+    const auto& hits = c->conv->last_recalls();
+    if (hits.empty()) {
+        c->last_recall_buf.clear();
+        return c->last_recall_buf.c_str();
+    }
+    std::ostringstream oss;
+    for (size_t i = 0; i < hits.size(); ++i) {
+        const auto& r = hits[i];
+        std::string snippet = r.content;
+        if (snippet.size() > 60) snippet = snippet.substr(0, 60) + "…";
+        oss << "[" << (i + 1) << "] file=" << r.file_id
+            << " score=" << r.score
+            << " title=" << r.title << "\n    " << snippet << "\n";
+    }
+    c->last_recall_buf = oss.str();
+    return c->last_recall_buf.c_str();
 }
 
 WF_API void winefox_last_perf(WineFoxCore* c, WineFoxPerf* out) {

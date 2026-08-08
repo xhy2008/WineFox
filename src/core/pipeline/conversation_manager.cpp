@@ -143,20 +143,22 @@ std::string ConversationManager::chat(const std::string& user_input,
 
     // --- Recall long-term memory for this turn ---
     std::string current_recall;
+    last_recalls_.clear();
     if (!user_input.empty() && recall_->embedder_ready()) {
         auto recalls = recall_->recall(user_input, cfg_.recall_top_k);
-#ifndef NDEBUG
-        // Debug build: dump the raw recall hits so we can inspect what the
-        // long-term memory actually surfaced for this query.
-        std::fprintf(stderr, "[recall] query=\"%s\" hits=%zu\n",
+        last_recalls_ = recalls;
+
+        // 记忆召回日志：在 LLM 开始生成之前打印本次召回的长期记忆，
+        // 供前端（winefox_world）调试记忆注入。
+        std::fprintf(stderr, "[recall] 查询: %s (命中 %zu 条)\n",
                      user_input.c_str(), recalls.size());
         for (size_t i = 0; i < recalls.size(); ++i) {
-            std::fprintf(stderr, "  [%zu] score=%.4f title=%s | %s\n",
-                         i + 1, recalls[i].score,
-                         recalls[i].title.c_str(), recalls[i].content.c_str());
+            std::fprintf(stderr, "  [%zu] file=%lld score=%.4f | %s\n",
+                         i + 1, recalls[i].file_id, recalls[i].score,
+                         recalls[i].content.c_str());
         }
         std::fflush(stderr);
-#endif
+
         if (!recalls.empty()) {
             current_recall = "[相关记忆]\n";
             int idx = 1;

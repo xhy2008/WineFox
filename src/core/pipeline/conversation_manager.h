@@ -73,6 +73,10 @@ public:
     // Emotion tag parsed from the last chat() reply.
     const std::string& last_emotion() const { return last_emotion_; }
 
+    // Long-term memories recalled for the last chat() turn (empty if none).
+    // Used by the frontend to log/debug what was injected as [相关记忆].
+    const std::vector<memory::Recall>& last_recalls() const { return last_recalls_; }
+
 private:
     // Build just the system message (persona + profile). Used by both
     // build_messages_ and the init() warmup to avoid code duplication.
@@ -90,6 +94,7 @@ private:
     Config   cfg_;
     long long session_id_ = -1;
     std::string last_emotion_ = "neutral";
+    std::vector<memory::Recall> last_recalls_;   // 上次对话召回的记忆
 };
 
 } // namespace pipeline

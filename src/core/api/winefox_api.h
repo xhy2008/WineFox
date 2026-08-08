@@ -69,6 +69,11 @@ WF_API const char* winefox_chat(WineFoxCore* core,
 // Returns "neutral" if no chat has been made yet.
 WF_API const char* winefox_last_emotion(WineFoxCore* core);
 
+// Get a human-readable log of the long-term memories recalled for the last
+// chat() call (one line per hit: file id, score, title, content snippet).
+// Returns an empty string if no memories were recalled.
+WF_API const char* winefox_last_recall(WineFoxCore* core);
+
 // Get performance data from the last chat() call.
 WF_API void winefox_last_perf(WineFoxCore* core, WineFoxPerf* out);
 
